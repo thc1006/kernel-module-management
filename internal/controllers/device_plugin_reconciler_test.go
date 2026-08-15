@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/kubernetes-sigs/kernel-module-management/internal/filter"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/node"
 	"strings"
 
@@ -23,8 +24,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -44,6 +48,7 @@ var _ = Describe("DevicePluginReconciler_Reconcile", func() {
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: moduleName},
 			Spec: kmmv1beta1.ModuleSpec{
 				DevicePlugin: &kmmv1beta1.DevicePluginSpec{},
+				ModuleLoader: &kmmv1beta1.ModuleLoaderSpec{},
 			},
 		}
 
@@ -64,10 +69,10 @@ var _ = Describe("DevicePluginReconciler_Reconcile", func() {
 		mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil)
 		mockReconHelper.EXPECT().setKMMOMetrics(ctx)
 		if handleTargetLabelsError {
-			mockReconHelper.EXPECT().handleDevicePluginTargetLabels(ctx, mod).Return(returnedError)
+			mockReconHelper.EXPECT().handleDevicePluginTargetLabels(ctx, mod, devicePluginDS).Return(returnedError)
 			goto executeTestFunction
 		}
-		mockReconHelper.EXPECT().handleDevicePluginTargetLabels(ctx, mod).Return(nil)
+		mockReconHelper.EXPECT().handleDevicePluginTargetLabels(ctx, mod, devicePluginDS).Return(nil)
 		if handlePluginError {
 			mockReconHelper.EXPECT().handleDevicePlugin(ctx, mod, devicePluginDS).Return(returnedError)
 			goto executeTestFunction
@@ -99,7 +104,7 @@ var _ = Describe("DevicePluginReconciler_Reconcile", func() {
 		gomock.InOrder(
 			mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil),
 			mockReconHelper.EXPECT().setKMMOMetrics(ctx),
-			mockReconHelper.EXPECT().handleDevicePluginTargetLabels(ctx, mod).Return(nil),
+			mockReconHelper.EXPECT().handleDevicePluginTargetLabels(ctx, mod, devicePluginDS).Return(nil),
 			mockReconHelper.EXPECT().handleDevicePlugin(ctx, mod, devicePluginDS).Return(nil),
 			mockReconHelper.EXPECT().garbageCollect(ctx, mod, devicePluginDS).Return(nil),
 			mockReconHelper.EXPECT().moduleUpdateDevicePluginStatus(ctx, mod, devicePluginDS).Return(nil),
@@ -118,8 +123,8 @@ var _ = Describe("DevicePluginReconciler_Reconcile", func() {
 		By("good flow")
 		gomock.InOrder(
 			mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil),
-			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(nil),
 			mockReconHelper.EXPECT().deleteDevicePluginDaemonSets(ctx, devicePluginDS).Return(nil),
+			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(nil),
 		)
 
 		res, err := dpr.Reconcile(ctx, mod)
@@ -129,6 +134,7 @@ var _ = Describe("DevicePluginReconciler_Reconcile", func() {
 		By("error flow - removeDevicePluginTargetLabels fails")
 		gomock.InOrder(
 			mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil),
+			mockReconHelper.EXPECT().deleteDevicePluginDaemonSets(ctx, devicePluginDS).Return(nil),
 			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(fmt.Errorf("some error")),
 		)
 
@@ -139,11 +145,46 @@ var _ = Describe("DevicePluginReconciler_Reconcile", func() {
 		By("error flow - deleteDevicePluginDaemonSets fails")
 		gomock.InOrder(
 			mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil),
-			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(nil),
 			mockReconHelper.EXPECT().deleteDevicePluginDaemonSets(ctx, devicePluginDS).Return(fmt.Errorf("some error")),
 		)
 
 		res, err = dpr.Reconcile(ctx, mod)
+		Expect(res).To(Equal(reconcile.Result{}))
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("cleans up stale target labels when the Module has no ModuleLoader", func() {
+		mod.Spec.ModuleLoader = nil
+		devicePluginDS := []appsv1.DaemonSet{{}}
+
+		gomock.InOrder(
+			mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil),
+			mockReconHelper.EXPECT().setKMMOMetrics(ctx),
+			mockReconHelper.EXPECT().handleDevicePlugin(ctx, mod, devicePluginDS).Return(nil),
+			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(nil),
+			mockReconHelper.EXPECT().garbageCollect(ctx, mod, devicePluginDS).Return(nil),
+			mockReconHelper.EXPECT().moduleUpdateDevicePluginStatus(ctx, mod, devicePluginDS).Return(nil),
+		)
+
+		res, err := dpr.Reconcile(ctx, mod)
+
+		Expect(res).To(Equal(reconcile.Result{}))
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("returns an error when cleaning up stale target labels fails", func() {
+		mod.Spec.ModuleLoader = nil
+		devicePluginDS := []appsv1.DaemonSet{{}}
+
+		gomock.InOrder(
+			mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil),
+			mockReconHelper.EXPECT().setKMMOMetrics(ctx),
+			mockReconHelper.EXPECT().handleDevicePlugin(ctx, mod, devicePluginDS).Return(nil),
+			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(fmt.Errorf("some error")),
+		)
+
+		res, err := dpr.Reconcile(ctx, mod)
+
 		Expect(res).To(Equal(reconcile.Result{}))
 		Expect(err).To(HaveOccurred())
 	})
@@ -170,8 +211,8 @@ var _ = Describe("DevicePluginReconciler_Reconcile", func() {
 		gomock.InOrder(
 			mockReconHelper.EXPECT().getModuleDevicePluginDaemonSets(ctx, mod.Name, mod.Namespace).Return(devicePluginDS, nil),
 			mockReconHelper.EXPECT().setKMMOMetrics(ctx),
-			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(nil),
 			mockReconHelper.EXPECT().deleteDevicePluginDaemonSets(ctx, devicePluginDS).Return(nil),
+			mockReconHelper.EXPECT().removeDevicePluginTargetLabels(ctx, mod).Return(nil),
 			mockReconHelper.EXPECT().clearDevicePluginStatus(ctx, mod).Return(nil),
 		)
 
@@ -1141,10 +1182,24 @@ var _ = Describe("DevicePluginReconciler_getModuleDevicePluginDaemonSets", func(
 	})
 })
 
+var _ = Describe("DevicePluginReconciler_SetupWithManager", func() {
+	It("should register the controller and all of its watches", func() {
+		mgr, err := manager.New(
+			&rest.Config{Host: "http://127.0.0.1:1"},
+			manager.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"}},
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		clnt := mgr.GetClient()
+		dpr := NewDevicePluginReconciler(clnt, nil, filter.New(clnt, nil), node.NewNode(clnt), scheme)
+
+		Expect(dpr.SetupWithManager(mgr)).To(Succeed())
+	})
+})
+
 var _ = Describe("devicePluginReconcilerHelper_handleDevicePluginTargetLabels", func() {
 	var (
 		ctrl *gomock.Controller
-		clnt *client.MockClient
 		nm   *node.MockNode
 		dprh devicePluginReconcilerHelper
 		ctx  context.Context
@@ -1153,79 +1208,93 @@ var _ = Describe("devicePluginReconcilerHelper_handleDevicePluginTargetLabels", 
 
 	BeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
-		clnt = client.NewMockClient(ctrl)
 		nm = node.NewMockNode(ctrl)
 		ctx = context.Background()
-		dprh = devicePluginReconcilerHelper{
-			client:  clnt,
-			nodeAPI: nm,
-		}
+		dprh = devicePluginReconcilerHelper{nodeAPI: nm}
 		mod = &kmmv1beta1.Module{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: moduleName},
-			Spec: kmmv1beta1.ModuleSpec{
-				DevicePlugin: &kmmv1beta1.DevicePluginSpec{},
-			},
+			Spec:       kmmv1beta1.ModuleSpec{DevicePlugin: &kmmv1beta1.DevicePluginSpec{}},
 		}
 	})
 
 	It("should return nil when DevicePlugin is nil", func() {
 		mod.Spec.DevicePlugin = nil
-		err := dprh.handleDevicePluginTargetLabels(ctx, mod)
-		Expect(err).NotTo(HaveOccurred())
+		Expect(dprh.handleDevicePluginTargetLabels(ctx, mod, nil)).To(Succeed())
 	})
 
-	It("should add target label to schedulable node", func() {
+	It("should reconcile the device-plugin-target label", func() {
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
 		targetLabel := utils.GetDevicePluginTargetNodeLabel(namespace, moduleName)
 
-		schedulableNode := v1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: "schedulable-node"},
-		}
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), gomock.Any()).Return(true)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).Return(nil)
 
-		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{schedulableNode}, nil)
-		nm.EXPECT().IsNodeSchedulable(&schedulableNode, mod.Spec.Tolerations).Return(true)
-		nm.EXPECT().UpdateLabels(ctx, &schedulableNode, map[string]string{targetLabel: ""}, nil).Return(nil)
-
-		err := dprh.handleDevicePluginTargetLabels(ctx, mod)
-		Expect(err).NotTo(HaveOccurred())
+		Expect(dprh.handleDevicePluginTargetLabels(ctx, mod, nil)).To(Succeed())
 	})
 
-	It("should remove target label from unschedulable node", func() {
+	It("should give the DaemonSets the target selector once the nodes carry the label", func() {
+		clnt := client.NewMockClient(ctrl)
+		dprh.client = clnt
+
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
 		targetLabel := utils.GetDevicePluginTargetNodeLabel(namespace, moduleName)
+		existing := []appsv1.DaemonSet{{ObjectMeta: metav1.ObjectMeta{Name: "old-version"}}}
 
-		unschedulableNode := v1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: "unschedulable-node"},
-		}
+		var labelled bool
+		gomock.InOrder(
+			nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil),
+			nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, nil),
+			nm.EXPECT().IsNodeSchedulable(gomock.Any(), gomock.Any()).Return(true),
+			nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).
+				DoAndReturn(func(context.Context, *v1.Node, map[string]string, map[string]string) error {
+					labelled = true
+					return nil
+				}),
+			clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, ds *appsv1.DaemonSet, _ ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+					Expect(labelled).To(BeTrue())
+					Expect(ds.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue(targetLabel, ""))
+					return nil
+				},
+			),
+		)
 
-		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{unschedulableNode}, nil)
-		nm.EXPECT().IsNodeSchedulable(&unschedulableNode, mod.Spec.Tolerations).Return(false)
-		nm.EXPECT().UpdateLabels(ctx, &unschedulableNode, nil, map[string]string{targetLabel: ""}).Return(nil)
-
-		err := dprh.handleDevicePluginTargetLabels(ctx, mod)
-		Expect(err).NotTo(HaveOccurred())
+		Expect(dprh.handleDevicePluginTargetLabels(ctx, mod, existing)).To(Succeed())
 	})
 
-	It("should continue processing nodes if one fails and return combined error", func() {
-		targetLabel := utils.GetDevicePluginTargetNodeLabel(namespace, moduleName)
+	It("should fail when an existing DaemonSet cannot be given the target selector", func() {
+		clnt := client.NewMockClient(ctrl)
+		dprh.client = clnt
 
-		node1 := v1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: "node1"},
-		}
-		node2 := v1.Node{
-			ObjectMeta: metav1.ObjectMeta{Name: "node2"},
-		}
+		existing := []appsv1.DaemonSet{{ObjectMeta: metav1.ObjectMeta{Name: "old-version"}}}
 
-		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{node1, node2}, nil)
-		nm.EXPECT().IsNodeSchedulable(&node1, mod.Spec.Tolerations).Return(true)
-		nm.EXPECT().UpdateLabels(ctx, &node1, map[string]string{targetLabel: ""}, nil).Return(fmt.Errorf("conflict"))
-		nm.EXPECT().IsNodeSchedulable(&node2, mod.Spec.Tolerations).Return(true)
-		nm.EXPECT().UpdateLabels(ctx, &node2, map[string]string{targetLabel: ""}, nil).Return(nil)
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, gomock.Any()).Return(nil, nil)
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).Return(fmt.Errorf("conflict"))
 
-		err := dprh.handleDevicePluginTargetLabels(ctx, mod)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("node1"))
-		Expect(err.Error()).NotTo(ContainSubstring("node2"))
+		Expect(dprh.handleDevicePluginTargetLabels(ctx, mod, existing)).NotTo(Succeed())
 	})
 })
+
+var _ = Describe("devicePluginReconcilerHelper_removeDevicePluginTargetLabels", func() {
+	It("should remove the device-plugin-target label", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		nm := node.NewMockNode(ctrl)
+		ctx := context.Background()
+		dprh := devicePluginReconcilerHelper{nodeAPI: nm}
+		mod := &kmmv1beta1.Module{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: moduleName}}
+		targetLabel := utils.GetDevicePluginTargetNodeLabel(namespace, moduleName)
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+		nm.EXPECT().UpdateLabels(ctx, &n, nil, map[string]string{targetLabel: ""}).Return(nil)
+
+		Expect(dprh.removeDevicePluginTargetLabels(ctx, mod)).To(Succeed())
+	})
+})
+
 var _ = Describe("DevicePluginSpec backward compatibility", func() {
 	It("should serialize JSON with the same field names as before the type refactoring", func() {
 		spec := kmmv1beta1.DevicePluginSpec{

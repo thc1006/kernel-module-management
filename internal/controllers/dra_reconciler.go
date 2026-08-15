@@ -24,6 +24,7 @@ import (
 	kmmv1beta1 "github.com/kubernetes-sigs/kernel-module-management/api/v1beta1"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/constants"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/filter"
+	"github.com/kubernetes-sigs/kernel-module-management/internal/module"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/node"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/utils"
 	appsv1 "k8s.io/api/apps/v1"
@@ -32,6 +33,8 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -57,17 +60,20 @@ const (
 
 type DRAReconciler struct {
 	client         client.Client
+	filter         *filter.Filter
 	reconHelperAPI draReconcilerHelperAPI
 }
 
 func NewDRAReconciler(
 	client client.Client,
+	filter *filter.Filter,
 	nodeAPI node.Node,
 	scheme *runtime.Scheme,
 ) *DRAReconciler {
 	reconHelperAPI := newDRAReconcilerHelper(client, nodeAPI, scheme)
 	return &DRAReconciler{
 		client:         client,
+		filter:         filter,
 		reconHelperAPI: reconHelperAPI,
 	}
 }
@@ -80,6 +86,16 @@ func (r *DRAReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			&resourcev1.DeviceClass{},
 			handler.EnqueueRequestsFromMapFunc(filter.DeviceClassToModuleReconcileRequest),
 			builder.WithPredicates(filter.HasLabel(constants.ModuleNameLabel)),
+		).
+		Watches(
+			&v1.Node{},
+			handler.EnqueueRequestsFromMapFunc(r.filter.FindDRAModulesForNode),
+			builder.WithPredicates(filter.PluginReconcilerNodePredicate()),
+		).
+		Watches(
+			&resourcev1.ResourceClaim{},
+			handler.EnqueueRequestsFromMapFunc(r.filter.FindDRAModulesForResourceClaim),
+			builder.WithPredicates(filter.ResourceClaimUsageChanged()),
 		).
 		Named(DRAReconcilerName).
 		Complete(
@@ -102,20 +118,46 @@ func (r *DRAReconciler) Reconcile(ctx context.Context, mod *kmmv1beta1.Module) (
 		return res, fmt.Errorf("could not get DeviceClasses for module %s, namespace %s: %v", mod.Name, mod.Namespace, err)
 	}
 
+	// Labels are always dropped after the resources that select on them, so that a failing node
+	// patch can never leave a DaemonSet requiring a label that is already gone.
 	if mod.GetDeletionTimestamp() != nil {
-		return ctrl.Result{}, r.reconHelperAPI.deleteDRAResources(ctx, mod.Name, mod.Namespace)
+		if err = r.reconHelperAPI.deleteDRAResources(ctx, mod.Name, mod.Namespace); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err = r.reconHelperAPI.removeDRATargetLabels(ctx, mod); err != nil {
+			return ctrl.Result{}, fmt.Errorf("could not remove dra-target labels on deletion: %v", err)
+		}
+		return ctrl.Result{}, nil
 	}
 
 	if mod.Spec.DRA == nil {
 		if err = r.reconHelperAPI.deleteDRAResources(ctx, mod.Name, mod.Namespace); err != nil {
 			return ctrl.Result{}, err
 		}
+		if err = r.reconHelperAPI.removeDRATargetLabels(ctx, mod); err != nil {
+			return ctrl.Result{}, fmt.Errorf("could not remove dra-target labels: %v", err)
+		}
 		return ctrl.Result{}, r.reconHelperAPI.clearDRAStatus(ctx, mod)
+	}
+
+	// Conversely, the label has to exist before the DaemonSet starts requiring it. There is only
+	// something to sequence the DRA Pod against while a kernel module is loaded, so without a
+	// module loader the label is dropped instead, once handleDRA has stopped selecting on it.
+	if mod.Spec.ModuleLoader != nil {
+		if err = r.reconHelperAPI.handleDRATargetLabels(ctx, mod, existingDRADS); err != nil {
+			return res, fmt.Errorf("could not reconcile dra-target labels: %v", err)
+		}
 	}
 
 	err = r.reconHelperAPI.handleDRA(ctx, mod, existingDRADS)
 	if err != nil {
 		return res, fmt.Errorf("could not handle DRA: %v", err)
+	}
+
+	if mod.Spec.ModuleLoader == nil {
+		if err = r.reconHelperAPI.removeDRATargetLabels(ctx, mod); err != nil {
+			return res, fmt.Errorf("could not remove stale dra-target labels: %v", err)
+		}
 	}
 
 	err = r.reconHelperAPI.garbageCollectDRADaemonSets(ctx, mod, existingDRADS)
@@ -143,6 +185,8 @@ func (r *DRAReconciler) Reconcile(ctx context.Context, mod *kmmv1beta1.Module) (
 type draReconcilerHelperAPI interface {
 	getModuleDRADaemonSets(ctx context.Context, name, namespace string) ([]appsv1.DaemonSet, error)
 	handleDRA(ctx context.Context, mod *kmmv1beta1.Module, existingDRADS []appsv1.DaemonSet) error
+	handleDRATargetLabels(ctx context.Context, mod *kmmv1beta1.Module, existingDRADS []appsv1.DaemonSet) error
+	removeDRATargetLabels(ctx context.Context, mod *kmmv1beta1.Module) error
 	garbageCollectDRADaemonSets(ctx context.Context, mod *kmmv1beta1.Module, existingDS []appsv1.DaemonSet) error
 	deleteDRAResources(ctx context.Context, moduleName, moduleNamespace string) error
 	moduleUpdateDRAStatus(ctx context.Context, mod *kmmv1beta1.Module, existingDRADS []appsv1.DaemonSet) error
@@ -209,6 +253,95 @@ func (drh *draReconcilerHelper) handleDRA(ctx context.Context, mod *kmmv1beta1.M
 	}
 
 	return err
+}
+
+// handleDRATargetLabels brings both sides of the dra-target label in line: the nodes carrying it,
+// then the DaemonSets selecting on it. That order matters, since a DaemonSet must never require a
+// label before the nodes it runs on have it.
+func (drh *draReconcilerHelper) handleDRATargetLabels(
+	ctx context.Context,
+	mod *kmmv1beta1.Module,
+	existingDRADS []appsv1.DaemonSet,
+) error {
+	if mod.Spec.DRA == nil {
+		return nil
+	}
+
+	inUse, err := drh.nodesUsingDRADriver(ctx, mod)
+	if err != nil {
+		return fmt.Errorf("could not determine which nodes still use the DRA driver: %v", err)
+	}
+
+	targetLabel := utils.GetDRATargetNodeLabel(mod.Namespace, mod.Name)
+
+	if err := reconcileTargetLabel(ctx, drh.nodeAPI, mod, targetLabel, inUse); err != nil {
+		return err
+	}
+
+	return ensureTargetNodeSelector(ctx, drh.client, existingDRADS, targetLabel)
+}
+
+// nodesUsingDRADriver returns the nodes running a Pod that still holds a ResourceClaim allocated to
+// this Module's DRA driver. The driver is what kubelet calls to unprepare those devices, so it has
+// to stay until they are done with it, even once the node is unschedulable or has dropped out of
+// the Module's selector. A Pod that is terminating still counts: unpreparing is exactly what it is
+// waiting for.
+func (drh *draReconcilerHelper) nodesUsingDRADriver(ctx context.Context, mod *kmmv1beta1.Module) (sets.Set[string], error) {
+	claims := resourcev1.ResourceClaimList{}
+	if err := drh.client.List(ctx, &claims); err != nil {
+		return nil, fmt.Errorf("could not list ResourceClaims: %v", err)
+	}
+
+	nodes := sets.New[string]()
+	for i := range claims.Items {
+		claim := &claims.Items[i]
+
+		if !claimUsesDriver(claim, mod.Spec.DRA.DriverName) {
+			continue
+		}
+
+		for _, consumer := range claim.Status.ReservedFor {
+			if consumer.APIGroup != "" || consumer.Resource != "pods" {
+				continue
+			}
+
+			pod := v1.Pod{}
+			key := types.NamespacedName{Namespace: claim.Namespace, Name: consumer.Name}
+			if err := drh.client.Get(ctx, key, &pod); apierrors.IsNotFound(err) {
+				continue
+			} else if err != nil {
+				return nil, fmt.Errorf("could not get Pod %s reserving ResourceClaim %s: %v", key, claim.Name, err)
+			}
+
+			// The reservation carries the UID, so a Pod recreated under the same name does not
+			// inherit it.
+			if pod.UID != consumer.UID || pod.Spec.NodeName == "" {
+				continue
+			}
+
+			nodes.Insert(pod.Spec.NodeName)
+		}
+	}
+
+	return nodes, nil
+}
+
+func claimUsesDriver(claim *resourcev1.ResourceClaim, driverName string) bool {
+	if claim.Status.Allocation == nil {
+		return false
+	}
+
+	for _, result := range claim.Status.Allocation.Devices.Results {
+		if result.Driver == driverName {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (drh *draReconcilerHelper) removeDRATargetLabels(ctx context.Context, mod *kmmv1beta1.Module) error {
+	return removeTargetLabel(ctx, drh.nodeAPI, utils.GetDRATargetNodeLabel(mod.Namespace, mod.Name))
 }
 
 func (drh *draReconcilerHelper) garbageCollectDRADaemonSets(ctx context.Context, mod *kmmv1beta1.Module, existingDS []appsv1.DaemonSet) error {
@@ -292,7 +425,7 @@ func (drh *draReconcilerHelper) moduleUpdateDRAStatus(ctx context.Context,
 		return nil
 	}
 
-	numTargetedNodes, err := drh.nodeAPI.GetNumTargetedNodes(ctx, mod.Spec.Selector, mod.Spec.Tolerations)
+	numTargetedNodes, err := drh.nodeAPI.GetNumTargetedNodes(ctx, mod.Spec.Selector, module.EffectiveTolerations(mod.Spec.Tolerations))
 	if err != nil {
 		return fmt.Errorf("failed to determine the number of nodes targeted by Module %s/%s selector: %v", mod.Namespace, mod.Name, err)
 	}
@@ -510,6 +643,7 @@ func (dsci *draDaemonSetCreatorImpl) setDRAAsDesired(
 
 	nodeSelector := map[string]string{
 		utils.GetKernelModuleReadyNodeLabel(mod.Namespace, mod.Name): "",
+		utils.GetDRATargetNodeLabel(mod.Namespace, mod.Name):         "",
 	}
 
 	if mod.Spec.ModuleLoader != nil {
@@ -519,6 +653,7 @@ func (dsci *draDaemonSetCreatorImpl) setDRAAsDesired(
 			nodeSelector[versionLabel] = mod.Spec.ModuleLoader.Container.Version
 		}
 	} else {
+		// Nothing to unload, so drain gating is unnecessary.
 		nodeSelector = mod.Spec.Selector
 	}
 

@@ -1332,3 +1332,6 @@ var _ = Describe("namespaceHelper_tryRemovingLabel", func() {
 	})
 
 })
+
+var _ = Describe("ModuleReconciler_Reconcile DRA drain barrier", func() {
+})

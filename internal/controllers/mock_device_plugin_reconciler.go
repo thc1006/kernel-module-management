@@ -112,17 +112,17 @@ func (mr *MockdevicePluginReconcilerHelperAPIMockRecorder) handleDevicePlugin(ct
 }
 
 // handleDevicePluginTargetLabels mocks base method.
-func (m *MockdevicePluginReconcilerHelperAPI) handleDevicePluginTargetLabels(ctx context.Context, mod *v1beta1.Module) error {
+func (m *MockdevicePluginReconcilerHelperAPI) handleDevicePluginTargetLabels(ctx context.Context, mod *v1beta1.Module, existingDevicePluginDS []v1.DaemonSet) error {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "handleDevicePluginTargetLabels", ctx, mod)
+	ret := m.ctrl.Call(m, "handleDevicePluginTargetLabels", ctx, mod, existingDevicePluginDS)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // handleDevicePluginTargetLabels indicates an expected call of handleDevicePluginTargetLabels.
-func (mr *MockdevicePluginReconcilerHelperAPIMockRecorder) handleDevicePluginTargetLabels(ctx, mod any) *gomock.Call {
+func (mr *MockdevicePluginReconcilerHelperAPIMockRecorder) handleDevicePluginTargetLabels(ctx, mod, existingDevicePluginDS any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "handleDevicePluginTargetLabels", reflect.TypeOf((*MockdevicePluginReconcilerHelperAPI)(nil).handleDevicePluginTargetLabels), ctx, mod)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "handleDevicePluginTargetLabels", reflect.TypeOf((*MockdevicePluginReconcilerHelperAPI)(nil).handleDevicePluginTargetLabels), ctx, mod, existingDevicePluginDS)
 }
 
 // moduleUpdateDevicePluginStatus mocks base method.

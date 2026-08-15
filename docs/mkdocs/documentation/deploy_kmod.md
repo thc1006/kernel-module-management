@@ -74,7 +74,22 @@ for modern hardware orchestration.
 The DRA DaemonSet will target nodes:
 
 - that match the `Module`'s `.spec.selector`;
-- on which the kernel module is loaded (using the `kmm.node.kubernetes.io/<namespace>.<modulename>.ready` label).
+- on which the kernel module is loaded (using the `kmm.node.kubernetes.io/<namespace>.<modulename>.ready` label);
+- that KMM still wants the driver on (using the `kmm.node.kubernetes.io/<namespace>.<modulename>.dra-target` label).
+
+KMM manages the `dra-target` label itself. DaemonSet pods tolerate the taint `kubectl cordon` adds, so without it a
+cordon would leave the driver pod in place while KMM tries to unload the kernel module underneath it. KMM removes the
+label from a node that is cordoned, that carries any other taint the `Module` does not tolerate, or that has stopped
+matching `.spec.selector`, and the DaemonSet controller then removes the driver pod.
+
+A cordoned node keeps the label for as long as a pod on it still holds a `ResourceClaim` allocated from this `Module`'s
+driver. Kubelet calls the driver to unprepare those devices, so it has to outlive its consumers; the label goes once the
+last such claim is released. A `Module` with no `.spec.moduleLoader` has no kernel module to unload, so its DRA
+DaemonSet targets `.spec.selector` directly and no `dra-target` label is used.
+
+The device plugin DaemonSet works the same way through its own
+`kmm.node.kubernetes.io/<namespace>.<modulename>.device-plugin-target` label, without the `ResourceClaim` part: the
+device plugin API has no equivalent of `NodeUnprepareResources`.
 
 When the DRA driver pod is running and ready on a node, KMM sets the following label:
 ```

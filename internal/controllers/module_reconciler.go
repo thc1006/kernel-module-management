@@ -52,6 +52,7 @@ import (
 //+kubebuilder:rbac:groups=kmm.sigs.x-k8s.io,resources=preflightvalidations,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=kmm.sigs.x-k8s.io,resources=preflightvalidations/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=resource.k8s.io,resources=deviceclasses,verbs=create;delete;deletecollection;get;list;patch;update;watch
+//+kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=list;watch
 
 const (
 	ModuleReconcilerName = "ModuleReconciler"
@@ -122,7 +123,7 @@ func (mr *ModuleReconciler) Reconcile(ctx context.Context, mod *kmmv1beta1.Modul
 	}
 
 	// get nodes targeted by selector
-	targetedNodes, err := mr.nodeAPI.GetSchedulableNodesBySelector(ctx, mod.Spec.Selector, append(mod.Spec.Tolerations, module.InternalTolerations...))
+	targetedNodes, err := mr.nodeAPI.GetSchedulableNodesBySelector(ctx, mod.Spec.Selector, module.EffectiveTolerations(mod.Spec.Tolerations))
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to get list of nodes by selector: %v", err)
 	}
