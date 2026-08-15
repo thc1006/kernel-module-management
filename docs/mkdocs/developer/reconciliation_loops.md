@@ -33,8 +33,21 @@ A separate DRA reconciler watches `Module` resources that have `.spec.dra` set.
    DeviceClasses are tracked via labels (`kmm.node.kubernetes.io/module.name` and
    `kmm.node.kubernetes.io/module.namespace`) since they are cluster-scoped while Modules are namespaced.
 
+1. The reconciler also watches nodes and keeps a
+   `kmm.node.kubernetes.io/<module-namespace>.<module-name>.dra-target` label on the schedulable nodes selected by the
+   `Module`. The DRA `DaemonSet` requires that label on top of the kernel-module-ready one, so cordoning a node removes
+   the DRA driver Pod before the kernel module is unloaded. The label is reconciled over both the nodes the `Module`
+   selects and the nodes already carrying it, so narrowing the selector, or removing a selector label from a node, takes
+   the label off too. Modules without a `.spec.moduleLoader` keep targeting `.spec.selector` directly, since they have
+   no kernel module to unload.
+
+1. The reconciler watches `ResourceClaim` resources as well, and keeps the `dra-target` label on any node where a Pod
+   still holds a claim allocated from this `Module`'s driver, whatever the node's taints and the `Module`'s selector
+   say. kubelet calls the driver to unprepare those devices, so it has to outlive its consumers; the label is dropped
+   once the last claim on the node is released.
+
 1. When `spec.dra` is removed or the `Module` is deleted, the reconciler deletes all associated DRA `DaemonSet` and
-   `DeviceClass` resources.
+   `DeviceClass` resources, and removes the `dra-target` label from every node carrying it.
 
 1. During [ordered upgrades](../documentation/ordered_upgrade.md), a new DRA `DaemonSet` is created for the new module
    version. Once the old-version `DaemonSet` is no longer scheduled on any node, it is garbage-collected.

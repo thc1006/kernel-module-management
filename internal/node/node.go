@@ -15,6 +15,7 @@ import (
 type Node interface {
 	IsNodeSchedulable(node *v1.Node, tolerations []v1.Toleration) bool
 	GetAllNodesBySelector(ctx context.Context, selector map[string]string) ([]v1.Node, error)
+	GetAllNodesByLabelKey(ctx context.Context, labelKey string) ([]v1.Node, error)
 	GetSchedulableNodesBySelector(ctx context.Context, selector map[string]string, tolerations []v1.Toleration) ([]v1.Node, error)
 	GetNumTargetedNodes(ctx context.Context, selector map[string]string, tolerations []v1.Toleration) (int, error)
 	UpdateLabels(ctx context.Context, node *v1.Node, toBeAdded, toBeRemoved map[string]string) error
@@ -59,6 +60,19 @@ func (n *node) GetAllNodesBySelector(ctx context.Context, selector map[string]st
 	return selectedNodes.Items, nil
 }
 
+// GetAllNodesByLabelKey lists the nodes carrying labelKey whatever its value, unlike
+// GetAllNodesBySelector, which matches on the value too.
+func (n *node) GetAllNodesByLabelKey(ctx context.Context, labelKey string) ([]v1.Node, error) {
+	logger := log.FromContext(ctx)
+	logger.V(1).Info("Listing nodes", "label key", labelKey)
+
+	selectedNodes := v1.NodeList{}
+	if err := n.client.List(ctx, &selectedNodes, client.HasLabels{labelKey}); err != nil {
+		return nil, fmt.Errorf("could not list nodes: %v", err)
+	}
+	return selectedNodes.Items, nil
+}
+
 func (n *node) GetSchedulableNodesBySelector(ctx context.Context, selector map[string]string, tolerations []v1.Toleration) ([]v1.Node, error) {
 	allNodes, err := n.GetAllNodesBySelector(ctx, selector)
 	if err != nil {
@@ -89,7 +103,7 @@ func (n *node) UpdateLabels(ctx context.Context, node *v1.Node, toBeAdded, toBeR
 	removeLabels(node, toBeRemoved)
 
 	if err := n.client.Patch(ctx, node, patchFrom); err != nil {
-		return fmt.Errorf("could not patch node: %v", err)
+		return fmt.Errorf("could not patch node: %w", err)
 	}
 	return nil
 }

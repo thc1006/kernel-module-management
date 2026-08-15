@@ -24,6 +24,8 @@ import (
 	kmmv1beta1 "github.com/kubernetes-sigs/kernel-module-management/api/v1beta1"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/client"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/constants"
+	"github.com/kubernetes-sigs/kernel-module-management/internal/filter"
+	"github.com/kubernetes-sigs/kernel-module-management/internal/module"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/node"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/utils"
 	. "github.com/onsi/ginkgo/v2"
@@ -36,11 +38,44 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
+
+var _ = Describe("NewDRAReconciler", func() {
+	It("should wire the filter used by the node watch", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		clnt := client.NewMockClient(ctrl)
+
+		dr := NewDRAReconciler(clnt, filter.New(clnt, nil), node.NewNode(clnt), scheme)
+
+		Expect(dr.client).To(Equal(clnt))
+		Expect(dr.filter).NotTo(BeNil())
+		Expect(dr.reconHelperAPI).NotTo(BeNil())
+	})
+})
+
+var _ = Describe("DRAReconciler_SetupWithManager", func() {
+	It("should register the controller and all of its watches", func() {
+		mgr, err := manager.New(
+			&rest.Config{Host: "http://127.0.0.1:1"},
+			manager.Options{Scheme: scheme, Metrics: metricsserver.Options{BindAddress: "0"}},
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		clnt := mgr.GetClient()
+		dr := NewDRAReconciler(clnt, filter.New(clnt, nil), node.NewNode(clnt), scheme)
+
+		Expect(dr.SetupWithManager(mgr)).To(Succeed())
+	})
+})
 
 var _ = Describe("DRAReconciler_Reconcile", func() {
 	const draModuleName = "dra-module"
@@ -59,7 +94,8 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 		mod = &kmmv1beta1.Module{
 			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: draModuleName},
 			Spec: kmmv1beta1.ModuleSpec{
-				DRA: &kmmv1beta1.DRASpec{},
+				DRA:          &kmmv1beta1.DRASpec{},
+				ModuleLoader: &kmmv1beta1.ModuleLoaderSpec{},
 			},
 		}
 
@@ -70,7 +106,7 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 
 	ctx := context.Background()
 
-	DescribeTable("check error flows", func(getDSError, getDCError, handleDRAError, gcError, handleDCError bool) {
+	DescribeTable("check error flows", func(getDSError, getDCError, targetLabelsError, handleDRAError, gcError, handleDCError bool) {
 		draDS := []appsv1.DaemonSet{{}}
 		returnedError := fmt.Errorf("some error")
 		if getDSError {
@@ -83,6 +119,11 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 			goto executeTestFunction
 		}
 		mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(nil, nil)
+		if targetLabelsError {
+			mockReconHelper.EXPECT().handleDRATargetLabels(ctx, mod, draDS).Return(returnedError)
+			goto executeTestFunction
+		}
+		mockReconHelper.EXPECT().handleDRATargetLabels(ctx, mod, draDS).Return(nil)
 		if handleDRAError {
 			mockReconHelper.EXPECT().handleDRA(ctx, mod, draDS).Return(returnedError)
 			goto executeTestFunction
@@ -107,12 +148,13 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 		Expect(err).To(HaveOccurred())
 
 	},
-		Entry("getModuleDRADaemonSets failed", true, false, false, false, false),
-		Entry("getModuleDeviceClasses failed", false, true, false, false, false),
-		Entry("handleDRA failed", false, false, true, false, false),
-		Entry("garbageCollectDRADaemonSets failed", false, false, false, true, false),
-		Entry("handleDeviceClasses failed", false, false, false, false, true),
-		Entry("moduleUpdateDRAStatus failed", false, false, false, false, false),
+		Entry("getModuleDRADaemonSets failed", true, false, false, false, false, false),
+		Entry("getModuleDeviceClasses failed", false, true, false, false, false, false),
+		Entry("handleDRATargetLabels failed", false, false, true, false, false, false),
+		Entry("handleDRA failed", false, false, false, true, false, false),
+		Entry("garbageCollectDRADaemonSets failed", false, false, false, false, true, false),
+		Entry("handleDeviceClasses failed", false, false, false, false, false, true),
+		Entry("moduleUpdateDRAStatus failed", false, false, false, false, false, false),
 	)
 
 	It("Good flow", func() {
@@ -120,6 +162,7 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 		gomock.InOrder(
 			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(draDS, nil),
 			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(nil, nil),
+			mockReconHelper.EXPECT().handleDRATargetLabels(ctx, mod, draDS).Return(nil),
 			mockReconHelper.EXPECT().handleDRA(ctx, mod, draDS).Return(nil),
 			mockReconHelper.EXPECT().garbageCollectDRADaemonSets(ctx, mod, draDS).Return(nil),
 			mockReconHelper.EXPECT().handleDeviceClasses(ctx, mod, []resourcev1.DeviceClass(nil)).Return(nil),
@@ -142,11 +185,24 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(draDS, nil),
 			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(existingDCs, nil),
 			mockReconHelper.EXPECT().deleteDRAResources(ctx, mod.Name, mod.Namespace).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(nil),
 		)
 
 		res, err := dr.Reconcile(ctx, mod)
 		Expect(res).To(Equal(reconcile.Result{}))
 		Expect(err).NotTo(HaveOccurred())
+
+		By("error flow - removeDRATargetLabels fails")
+		gomock.InOrder(
+			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(draDS, nil),
+			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(existingDCs, nil),
+			mockReconHelper.EXPECT().deleteDRAResources(ctx, mod.Name, mod.Namespace).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(fmt.Errorf("some error")),
+		)
+
+		res, err = dr.Reconcile(ctx, mod)
+		Expect(res).To(Equal(reconcile.Result{}))
+		Expect(err).To(HaveOccurred())
 
 		By("error flow - deleteDRAResources fails")
 		gomock.InOrder(
@@ -166,6 +222,7 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(nil, nil),
 			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(nil, nil),
 			mockReconHelper.EXPECT().deleteDRAResources(ctx, mod.Name, mod.Namespace).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(nil),
 			mockReconHelper.EXPECT().clearDRAStatus(ctx, mod).Return(nil),
 		)
 
@@ -184,6 +241,7 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(draDS, nil),
 			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(existingDCs, nil),
 			mockReconHelper.EXPECT().deleteDRAResources(ctx, mod.Name, mod.Namespace).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(nil),
 			mockReconHelper.EXPECT().clearDRAStatus(ctx, mod).Return(nil),
 		)
 
@@ -200,7 +258,61 @@ var _ = Describe("DRAReconciler_Reconcile", func() {
 			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(nil, nil),
 			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(nil, nil),
 			mockReconHelper.EXPECT().deleteDRAResources(ctx, mod.Name, mod.Namespace).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(nil),
 			mockReconHelper.EXPECT().clearDRAStatus(ctx, mod).Return(fmt.Errorf("some error")),
+		)
+
+		res, err := dr.Reconcile(ctx, mod)
+
+		Expect(res).To(Equal(reconcile.Result{}))
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("cleanup when spec.dra is nil and removeDRATargetLabels fails", func() {
+		mod.Spec.DRA = nil
+
+		gomock.InOrder(
+			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(nil, nil),
+			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(nil, nil),
+			mockReconHelper.EXPECT().deleteDRAResources(ctx, mod.Name, mod.Namespace).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(fmt.Errorf("some error")),
+		)
+
+		res, err := dr.Reconcile(ctx, mod)
+
+		Expect(res).To(Equal(reconcile.Result{}))
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("cleans up stale target labels when the Module has no ModuleLoader", func() {
+		mod.Spec.ModuleLoader = nil
+		draDS := []appsv1.DaemonSet{{}}
+
+		gomock.InOrder(
+			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(draDS, nil),
+			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(nil, nil),
+			mockReconHelper.EXPECT().handleDRA(ctx, mod, draDS).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(nil),
+			mockReconHelper.EXPECT().garbageCollectDRADaemonSets(ctx, mod, draDS).Return(nil),
+			mockReconHelper.EXPECT().handleDeviceClasses(ctx, mod, []resourcev1.DeviceClass(nil)).Return(nil),
+			mockReconHelper.EXPECT().moduleUpdateDRAStatus(ctx, mod, draDS).Return(nil),
+		)
+
+		res, err := dr.Reconcile(ctx, mod)
+
+		Expect(res).To(Equal(reconcile.Result{}))
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("returns an error when cleaning up stale target labels fails", func() {
+		mod.Spec.ModuleLoader = nil
+		draDS := []appsv1.DaemonSet{{}}
+
+		gomock.InOrder(
+			mockReconHelper.EXPECT().getModuleDRADaemonSets(ctx, mod.Name, mod.Namespace).Return(draDS, nil),
+			mockReconHelper.EXPECT().getModuleDeviceClasses(ctx, mod.Name, mod.Namespace).Return(nil, nil),
+			mockReconHelper.EXPECT().handleDRA(ctx, mod, draDS).Return(nil),
+			mockReconHelper.EXPECT().removeDRATargetLabels(ctx, mod).Return(fmt.Errorf("some error")),
 		)
 
 		res, err := dr.Reconcile(ctx, mod)
@@ -298,6 +410,113 @@ var _ = Describe("DRAReconciler_handleDRA", func() {
 		err := drh.handleDRA(ctx, &mod, []appsv1.DaemonSet{existingDS})
 
 		Expect(err).NotTo(HaveOccurred())
+	})
+})
+
+var _ = Describe("draReconcilerHelper_handleDRATargetLabels", func() {
+	const draModuleName = "dra-module"
+
+	var (
+		ctrl *gomock.Controller
+		clnt *client.MockClient
+		nm   *node.MockNode
+		drh  draReconcilerHelper
+		ctx  context.Context
+		mod  *kmmv1beta1.Module
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		nm = node.NewMockNode(ctrl)
+		ctx = context.Background()
+		clnt = client.NewMockClient(ctrl)
+		drh = draReconcilerHelper{nodeAPI: nm, client: clnt}
+		mod = &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: draModuleName},
+			Spec:       kmmv1beta1.ModuleSpec{DRA: &kmmv1beta1.DRASpec{DriverName: "gpu.example.com"}},
+		}
+	})
+
+	It("should return nil when DRA is nil", func() {
+		mod.Spec.DRA = nil
+		Expect(drh.handleDRATargetLabels(ctx, mod, nil)).To(Succeed())
+	})
+
+	It("should fail when the claim lookup fails", func() {
+		clnt.EXPECT().List(ctx, gomock.Any()).Return(fmt.Errorf("some error"))
+
+		Expect(drh.handleDRATargetLabels(ctx, mod, nil)).NotTo(Succeed())
+	})
+
+	It("should reconcile the dra-target label", func() {
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+		targetLabel := utils.GetDRATargetNodeLabel(namespace, draModuleName)
+
+		clnt.EXPECT().List(ctx, gomock.Any()).Return(nil)
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), gomock.Any()).Return(true)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).Return(nil)
+
+		Expect(drh.handleDRATargetLabels(ctx, mod, nil)).To(Succeed())
+	})
+
+	It("should give the DaemonSets the target selector once the nodes carry the label", func() {
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+		targetLabel := utils.GetDRATargetNodeLabel(namespace, draModuleName)
+		existing := []appsv1.DaemonSet{{ObjectMeta: metav1.ObjectMeta{Name: "old-version"}}}
+
+		var labelled bool
+		gomock.InOrder(
+			clnt.EXPECT().List(ctx, gomock.Any()).Return(nil),
+			nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil),
+			nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, nil),
+			nm.EXPECT().IsNodeSchedulable(gomock.Any(), gomock.Any()).Return(true),
+			nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).
+				DoAndReturn(func(context.Context, *v1.Node, map[string]string, map[string]string) error {
+					labelled = true
+					return nil
+				}),
+			clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, ds *appsv1.DaemonSet, _ ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+					Expect(labelled).To(BeTrue())
+					Expect(ds.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue(targetLabel, ""))
+					return nil
+				},
+			),
+		)
+
+		Expect(drh.handleDRATargetLabels(ctx, mod, existing)).To(Succeed())
+	})
+
+	It("should fail when an existing DaemonSet cannot be given the target selector", func() {
+		existing := []appsv1.DaemonSet{{ObjectMeta: metav1.ObjectMeta{Name: "old-version"}}}
+
+		clnt.EXPECT().List(ctx, gomock.Any()).Return(nil)
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, gomock.Any()).Return(nil, nil)
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).Return(fmt.Errorf("conflict"))
+
+		Expect(drh.handleDRATargetLabels(ctx, mod, existing)).NotTo(Succeed())
+	})
+})
+
+var _ = Describe("draReconcilerHelper_removeDRATargetLabels", func() {
+	const draModuleName = "dra-module"
+
+	It("should remove the dra-target label", func() {
+		ctrl := gomock.NewController(GinkgoT())
+		nm := node.NewMockNode(ctrl)
+		ctx := context.Background()
+		drh := draReconcilerHelper{nodeAPI: nm}
+		mod := &kmmv1beta1.Module{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: draModuleName}}
+		targetLabel := utils.GetDRATargetNodeLabel(namespace, draModuleName)
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+		nm.EXPECT().UpdateLabels(ctx, &n, nil, map[string]string{targetLabel: ""}).Return(nil)
+
+		Expect(drh.removeDRATargetLabels(ctx, mod)).To(Succeed())
 	})
 })
 
@@ -839,6 +1058,50 @@ var _ = Describe("DRAReconciler_setDRAAsDesired", func() {
 		Expect(ds.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue(
 			utils.GetKernelModuleReadyNodeLabel(namespace, draModuleName), "",
 		))
+		Expect(ds.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue(
+			utils.GetDRATargetNodeLabel(namespace, draModuleName), "",
+		))
+	})
+
+	It("should require both the ready and target labels when a ModuleLoader is defined", func() {
+		mod := kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{Name: draModuleName, Namespace: namespace},
+			Spec: kmmv1beta1.ModuleSpec{
+				Selector:     map[string]string{"kubernetes.io/hostname": "node1"},
+				ModuleLoader: &kmmv1beta1.ModuleLoaderSpec{},
+				DRA: &kmmv1beta1.DRASpec{
+					Container:  kmmv1beta1.CommonContainerSpec{Image: draImage},
+					DriverName: "test.driver",
+				},
+			},
+		}
+
+		ds := appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: namespace}}
+		Expect(dsc.setDRAAsDesired(context.Background(), &ds, &mod)).To(Succeed())
+
+		Expect(ds.Spec.Template.Spec.NodeSelector).To(Equal(map[string]string{
+			utils.GetKernelModuleReadyNodeLabel(namespace, draModuleName): "",
+			utils.GetDRATargetNodeLabel(namespace, draModuleName):         "",
+		}))
+	})
+
+	It("should fall back to the Module selector when no ModuleLoader is defined", func() {
+		selector := map[string]string{"kubernetes.io/hostname": "node1"}
+		mod := kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{Name: draModuleName, Namespace: namespace},
+			Spec: kmmv1beta1.ModuleSpec{
+				Selector: selector,
+				DRA: &kmmv1beta1.DRASpec{
+					Container:  kmmv1beta1.CommonContainerSpec{Image: draImage},
+					DriverName: "test.driver",
+				},
+			},
+		}
+
+		ds := appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Namespace: namespace}}
+		Expect(dsc.setDRAAsDesired(context.Background(), &ds, &mod)).To(Succeed())
+
+		Expect(ds.Spec.Template.Spec.NodeSelector).To(Equal(selector))
 	})
 })
 
@@ -1321,5 +1584,604 @@ var _ = Describe("DRAReconciler_deleteDRAResources", func() {
 		Expect(err).To(HaveOccurred())
 		Expect(err.Error()).To(ContainSubstring("DaemonSets"))
 		Expect(err.Error()).To(ContainSubstring("DeviceClasses"))
+	})
+})
+
+var _ = Describe("draReconcilerHelper_nodesUsingDRADriver", func() {
+	const (
+		driverName = "gpu.example.com"
+		claimNS    = "workloads"
+	)
+
+	var (
+		ctrl *gomock.Controller
+		clnt *client.MockClient
+		drh  draReconcilerHelper
+		ctx  context.Context
+		mod  *kmmv1beta1.Module
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		clnt = client.NewMockClient(ctrl)
+		ctx = context.Background()
+		drh = draReconcilerHelper{client: clnt}
+		mod = &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "dra-module"},
+			Spec:       kmmv1beta1.ModuleSpec{DRA: &kmmv1beta1.DRASpec{DriverName: driverName}},
+		}
+	})
+
+	claim := func(driver string, consumers ...resourcev1.ResourceClaimConsumerReference) resourcev1.ResourceClaim {
+		c := resourcev1.ResourceClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: "claim", Namespace: claimNS},
+		}
+		if driver != "" {
+			c.Status.Allocation = &resourcev1.AllocationResult{
+				Devices: resourcev1.DeviceAllocationResult{
+					Results: []resourcev1.DeviceRequestAllocationResult{{Driver: driver}},
+				},
+			}
+		}
+		c.Status.ReservedFor = consumers
+		return c
+	}
+
+	podConsumer := func(name string, uid types.UID) resourcev1.ResourceClaimConsumerReference {
+		return resourcev1.ResourceClaimConsumerReference{Resource: "pods", Name: name, UID: uid}
+	}
+
+	expectClaims := func(claims ...resourcev1.ResourceClaim) {
+		clnt.EXPECT().List(ctx, gomock.Any()).DoAndReturn(
+			func(_ interface{}, list *resourcev1.ResourceClaimList, _ ...interface{}) error {
+				list.Items = claims
+				return nil
+			},
+		)
+	}
+
+	expectPod := func(name string, uid types.UID, nodeName string) {
+		clnt.EXPECT().Get(ctx, types.NamespacedName{Namespace: claimNS, Name: name}, gomock.Any()).DoAndReturn(
+			func(_ context.Context, _ types.NamespacedName, p *v1.Pod, _ ...ctrlclient.GetOption) error {
+				p.UID = uid
+				p.Spec.NodeName = nodeName
+				return nil
+			},
+		)
+	}
+
+	It("should return the node of a Pod still holding a claim for this driver", func() {
+		expectClaims(claim(driverName, podConsumer("consumer", "uid-1")))
+		expectPod("consumer", "uid-1", "node1")
+
+		nodes, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes.UnsortedList()).To(ConsistOf("node1"))
+	})
+
+	It("should ignore claims allocated from another driver", func() {
+		expectClaims(claim("other.example.com", podConsumer("consumer", "uid-1")))
+
+		nodes, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes).To(BeEmpty())
+	})
+
+	It("should ignore claims that were never allocated", func() {
+		expectClaims(claim("", podConsumer("consumer", "uid-1")))
+
+		nodes, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes).To(BeEmpty())
+	})
+
+	It("should not trust a Pod recreated under the same name", func() {
+		expectClaims(claim(driverName, podConsumer("consumer", "uid-1")))
+		expectPod("consumer", "uid-2", "node1")
+
+		nodes, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes).To(BeEmpty())
+	})
+
+	It("should skip a consumer whose Pod is already gone", func() {
+		expectClaims(claim(driverName, podConsumer("consumer", "uid-1")))
+		clnt.EXPECT().Get(ctx, gomock.Any(), gomock.Any()).
+			Return(apierrors.NewNotFound(v1.Resource("pods"), "consumer"))
+
+		nodes, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes).To(BeEmpty())
+	})
+
+	It("should skip a consumer that is not yet scheduled", func() {
+		expectClaims(claim(driverName, podConsumer("consumer", "uid-1")))
+		expectPod("consumer", "uid-1", "")
+
+		nodes, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes).To(BeEmpty())
+	})
+
+	It("should ignore consumers that are not Pods", func() {
+		expectClaims(claim(driverName, resourcev1.ResourceClaimConsumerReference{
+			APIGroup: "apps", Resource: "deployments", Name: "d", UID: "uid-1",
+		}))
+
+		nodes, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(nodes).To(BeEmpty())
+	})
+
+	It("should return an error when getting the consumer Pod fails", func() {
+		expectClaims(claim(driverName, podConsumer("consumer", "uid-1")))
+		clnt.EXPECT().Get(ctx, gomock.Any(), gomock.Any()).Return(fmt.Errorf("some error"))
+
+		_, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should return an error when listing claims fails", func() {
+		clnt.EXPECT().List(ctx, gomock.Any()).Return(fmt.Errorf("some error"))
+
+		_, err := drh.nodesUsingDRADriver(ctx, mod)
+		Expect(err).To(HaveOccurred())
+	})
+})
+
+const targetLabel = "kmm.node.kubernetes.io/namespace.module.some-target"
+
+func labeledNode(name string) v1.Node {
+	return v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{targetLabel: ""}},
+	}
+}
+
+var _ = Describe("draReconcilerHelper_reconcileDRATargetLabel", func() {
+	var (
+		ctrl        *gomock.Controller
+		clnt        *client.MockClient
+		nm          *node.MockNode
+		drh         draReconcilerHelper
+		ctx         context.Context
+		mod         *kmmv1beta1.Module
+		tolerations []v1.Toleration
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		clnt = client.NewMockClient(ctrl)
+		nm = node.NewMockNode(ctrl)
+		ctx = context.Background()
+		drh = draReconcilerHelper{client: clnt, nodeAPI: nm}
+		mod = &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "module"},
+			Spec:       kmmv1beta1.ModuleSpec{Selector: map[string]string{"worker": "true"}},
+		}
+		tolerations = module.EffectiveTolerations(mod.Spec.Tolerations)
+	})
+
+	It("should return an error when listing selected nodes fails", func() {
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, fmt.Errorf("some error"))
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).NotTo(Succeed())
+	})
+
+	It("should return an error when listing labeled nodes fails", func() {
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, fmt.Errorf("some error"))
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).NotTo(Succeed())
+	})
+
+	It("should add the label to a selected, schedulable node", func() {
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, nil)
+		nm.EXPECT().IsNodeSchedulable(&n, tolerations).Return(true)
+		nm.EXPECT().UpdateLabels(ctx, &n, map[string]string{targetLabel: ""}, nil).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should remove the label from a selected but unschedulable node", func() {
+		n := labeledNode("node1")
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), tolerations).Return(false)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), nil, map[string]string{targetLabel: ""}).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should remove the label from a node the selector no longer matches", func() {
+		stale := labeledNode("stale-node")
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{stale}, nil)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), nil, map[string]string{targetLabel: ""}).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should remove the label from an unselected node even while it is unschedulable", func() {
+		stale := labeledNode("cordoned-stale-node")
+		stale.Spec.Taints = []v1.Taint{{Key: v1.TaintNodeUnschedulable, Effect: v1.TaintEffectNoSchedule}}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{stale}, nil)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), nil, map[string]string{targetLabel: ""}).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should restore the label once a node matches the selector again", func() {
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: map[string]string{"worker": "true"}}}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), tolerations).Return(true)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should not patch any node once the cluster has converged", func() {
+		labeled := labeledNode("labeled-and-selected")
+		unlabeled := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "unlabeled-and-unschedulable"}}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{labeled, unlabeled}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{labeled}, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), tolerations).DoAndReturn(
+			func(n *v1.Node, _ []v1.Toleration) bool { return n.Name == labeled.Name },
+		).Times(2)
+
+		// No UpdateLabels expectation: any patch here fails the test.
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	DescribeTable("should keep the label on a node whose taint does not make it a non-target",
+		func(taint v1.Taint, modTolerations []v1.Toleration) {
+			mod.Spec.Tolerations = modTolerations
+			taintedNode := v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "tainted-node"},
+				Spec:       v1.NodeSpec{Taints: []v1.Taint{taint}},
+			}
+
+			gomock.InOrder(
+				clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ interface{}, list *v1.NodeList, _ ...interface{}) error {
+						list.Items = []v1.Node{taintedNode}
+						return nil
+					},
+				),
+				clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).Return(nil),
+				clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ context.Context, n *v1.Node, _ ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+						Expect(n.Labels).To(HaveKeyWithValue(targetLabel, ""))
+						return nil
+					},
+				),
+			)
+
+			Expect((&draReconcilerHelper{nodeAPI: node.NewNode(clnt)}).reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+		},
+		Entry(
+			"cordoned, but the Module tolerates it",
+			v1.Taint{Key: v1.TaintNodeUnschedulable, Effect: v1.TaintEffectNoSchedule},
+			[]v1.Toleration{{Key: v1.TaintNodeUnschedulable, Operator: v1.TolerationOpExists, Effect: v1.TaintEffectNoSchedule}},
+		),
+		Entry(
+			"under memory pressure, which the module reconciler tolerates internally",
+			v1.Taint{Key: v1.TaintNodeMemoryPressure, Effect: v1.TaintEffectNoSchedule},
+			nil,
+		),
+		Entry(
+			"under disk pressure, which the module reconciler tolerates internally",
+			v1.Taint{Key: v1.TaintNodeDiskPressure, Effect: v1.TaintEffectNoSchedule},
+			nil,
+		),
+		Entry(
+			"under PID pressure, which the module reconciler tolerates internally",
+			v1.Taint{Key: v1.TaintNodePIDPressure, Effect: v1.TaintEffectNoSchedule},
+			nil,
+		),
+	)
+
+	It("should remove the label from a node carrying an untolerated taint", func() {
+		taintedNode := labeledNode("tainted-node")
+		taintedNode.Labels["worker"] = "true"
+		taintedNode.Spec.Taints = []v1.Taint{{Key: "dedicated", Effect: v1.TaintEffectNoSchedule}}
+
+		gomock.InOrder(
+			clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ interface{}, list *v1.NodeList, _ ...interface{}) error {
+					list.Items = []v1.Node{taintedNode}
+					return nil
+				},
+			),
+			clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).Return(nil),
+			clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, n *v1.Node, _ ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+					Expect(n.Labels).NotTo(HaveKey(targetLabel))
+					return nil
+				},
+			),
+		)
+
+		Expect((&draReconcilerHelper{nodeAPI: node.NewNode(clnt)}).reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should normalize a target label whose value is not empty", func() {
+		n := v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "node1", Labels: map[string]string{targetLabel: "corrupted"}},
+		}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), tolerations).Return(true)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should remove a non-empty target label from a node the selector no longer matches", func() {
+		n := v1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: "stale", Labels: map[string]string{targetLabel: "corrupted"}},
+		}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), nil, map[string]string{targetLabel: ""}).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+	})
+
+	It("should continue processing nodes if one fails and return a combined error", func() {
+		node1 := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node1"}}
+		node2 := labeledNode("node2")
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{node1, node2}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{node2}, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), tolerations).DoAndReturn(
+			func(n *v1.Node, _ []v1.Toleration) bool { return n.Name == "node1" },
+		).Times(2)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).Return(fmt.Errorf("conflict"))
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), nil, map[string]string{targetLabel: ""}).Return(fmt.Errorf("conflict"))
+
+		err := drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("node1"))
+		Expect(err.Error()).To(ContainSubstring("node2"))
+	})
+})
+
+var _ = Describe("draReconcilerHelper_reconcileDRATargetLabel node deletion race", func() {
+	var (
+		ctrl *gomock.Controller
+		clnt *client.MockClient
+		ctx  context.Context
+		mod  *kmmv1beta1.Module
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		clnt = client.NewMockClient(ctrl)
+		ctx = context.Background()
+		mod = &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "module"},
+			Spec:       kmmv1beta1.ModuleSpec{Selector: map[string]string{"worker": "true"}},
+		}
+	})
+
+	// These go through the real node API rather than a mock, so that the error wrapping it relies
+	// on is covered too.
+	DescribeTable("should not fail the reconciliation when a node disappears mid-flight",
+		func(selected, labeled []v1.Node) {
+			gomock.InOrder(
+				clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ interface{}, list *v1.NodeList, _ ...interface{}) error {
+						list.Items = selected
+						return nil
+					},
+				),
+				clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+					func(_ interface{}, list *v1.NodeList, _ ...interface{}) error {
+						list.Items = labeled
+						return nil
+					},
+				),
+				clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).
+					Return(apierrors.NewNotFound(v1.Resource("nodes"), "going-away")),
+			)
+
+			Expect((&draReconcilerHelper{nodeAPI: node.NewNode(clnt)}).reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
+		},
+		Entry("while the label is being added",
+			[]v1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "going-away"}}},
+			nil,
+		),
+		Entry("while the label is being removed",
+			nil,
+			[]v1.Node{labeledNode("going-away")},
+		),
+	)
+})
+
+var _ = Describe("draReconcilerHelper_ensureDRATargetNodeSelector", func() {
+	var (
+		ctrl *gomock.Controller
+		clnt *client.MockClient
+		drh  draReconcilerHelper
+		ctx  context.Context
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		clnt = client.NewMockClient(ctrl)
+		drh = draReconcilerHelper{client: clnt}
+		ctx = context.Background()
+	})
+
+	dsWithSelector := func(name string, selector map[string]string) appsv1.DaemonSet {
+		return appsv1.DaemonSet{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec: appsv1.DaemonSetSpec{
+				Template: v1.PodTemplateSpec{Spec: v1.PodSpec{NodeSelector: selector}},
+			},
+		}
+	}
+
+	It("should add the target selector to every DaemonSet missing it", func() {
+		const (
+			readyLabel   = "kmm.node.kubernetes.io/namespace.module.ready"
+			versionLabel = "beta.kmm.node.kubernetes.io/version-schedule-pod.namespace.module"
+		)
+
+		existing := []appsv1.DaemonSet{
+			dsWithSelector("old-version", map[string]string{readyLabel: "", versionLabel: "1"}),
+			dsWithSelector("current-version", map[string]string{readyLabel: "", versionLabel: "2"}),
+		}
+
+		patched := make(map[string]map[string]string)
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, ds *appsv1.DaemonSet, _ ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+				patched[ds.Name] = ds.Spec.Template.Spec.NodeSelector
+				return nil
+			},
+		).Times(2)
+
+		Expect(drh.ensureDRATargetNodeSelector(ctx, existing, targetLabel)).To(Succeed())
+
+		// Each DaemonSet keeps its own version selector and only gains the shared target label.
+		Expect(patched).To(Equal(map[string]map[string]string{
+			"old-version":     {readyLabel: "", versionLabel: "1", targetLabel: ""},
+			"current-version": {readyLabel: "", versionLabel: "2", targetLabel: ""},
+		}))
+	})
+
+	It("should populate an empty node selector", func() {
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, ds *appsv1.DaemonSet, _ ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+				Expect(ds.Spec.Template.Spec.NodeSelector).To(Equal(map[string]string{targetLabel: ""}))
+				return nil
+			},
+		)
+
+		Expect(drh.ensureDRATargetNodeSelector(ctx, []appsv1.DaemonSet{dsWithSelector("no-selector", nil)}, targetLabel)).To(Succeed())
+	})
+
+	It("should normalize a target selector whose value is not empty", func() {
+		existing := []appsv1.DaemonSet{dsWithSelector("corrupted", map[string]string{targetLabel: "wrong"})}
+
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ context.Context, ds *appsv1.DaemonSet, _ ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+				Expect(ds.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue(targetLabel, ""))
+				return nil
+			},
+		)
+
+		Expect(drh.ensureDRATargetNodeSelector(ctx, existing, targetLabel)).To(Succeed())
+	})
+
+	It("should skip a DaemonSet that is already being deleted", func() {
+		ds := dsWithSelector("going-away", nil)
+		ds.SetDeletionTimestamp(&metav1.Time{})
+
+		// No Patch expectation: any call fails the test.
+		Expect(drh.ensureDRATargetNodeSelector(ctx, []appsv1.DaemonSet{ds}, targetLabel)).To(Succeed())
+	})
+
+	It("should not fail when a DaemonSet disappears mid-flight", func() {
+		existing := []appsv1.DaemonSet{dsWithSelector("going-away", nil)}
+
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).
+			Return(apierrors.NewNotFound(appsv1.Resource("daemonsets"), "going-away"))
+
+		Expect(drh.ensureDRATargetNodeSelector(ctx, existing, targetLabel)).To(Succeed())
+	})
+
+	It("should not patch a DaemonSet that already has the target selector", func() {
+		existing := []appsv1.DaemonSet{dsWithSelector("already-migrated", map[string]string{targetLabel: ""})}
+
+		// No Patch expectation: any call fails the test.
+		Expect(drh.ensureDRATargetNodeSelector(ctx, existing, targetLabel)).To(Succeed())
+	})
+
+	It("should keep going and aggregate errors when a patch fails", func() {
+		existing := []appsv1.DaemonSet{dsWithSelector("first", nil), dsWithSelector("second", nil)}
+
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).Return(fmt.Errorf("conflict"))
+		clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).Return(nil)
+
+		err := drh.ensureDRATargetNodeSelector(ctx, existing, targetLabel)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("first"))
+		Expect(err.Error()).NotTo(ContainSubstring("second"))
+	})
+})
+
+var _ = Describe("draReconcilerHelper_reconcileDRATargetLabel in-use override", func() {
+	var (
+		ctrl *gomock.Controller
+		nm   *node.MockNode
+		drh  draReconcilerHelper
+		ctx  context.Context
+		mod  *kmmv1beta1.Module
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		nm = node.NewMockNode(ctrl)
+		ctx = context.Background()
+		drh = draReconcilerHelper{nodeAPI: nm}
+		mod = &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "module"},
+			Spec:       kmmv1beta1.ModuleSpec{Selector: map[string]string{"worker": "true"}},
+		}
+	})
+
+	It("should keep the label on a cordoned node that is still in use", func() {
+		n := labeledNode("cordoned-but-in-use")
+		n.Spec.Taints = []v1.Taint{{Key: v1.TaintNodeUnschedulable, Effect: v1.TaintEffectNoSchedule}}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+
+		// No IsNodeSchedulable and no UpdateLabels: being in use settles it on its own.
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, sets.New(n.Name))).To(Succeed())
+	})
+
+	It("should keep the label on a node the selector no longer matches while it is still in use", func() {
+		n := labeledNode("unselected-but-in-use")
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return(nil, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, sets.New(n.Name))).To(Succeed())
+	})
+
+	It("should add the label back to an in-use node that has lost it", func() {
+		n := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "in-use-unlabeled"}}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return(nil, nil)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), map[string]string{targetLabel: ""}, nil).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, sets.New(n.Name))).To(Succeed())
+	})
+
+	It("should drop the label once the node stops being in use", func() {
+		n := labeledNode("no-longer-in-use")
+		n.Spec.Taints = []v1.Taint{{Key: v1.TaintNodeUnschedulable, Effect: v1.TaintEffectNoSchedule}}
+
+		nm.EXPECT().GetAllNodesBySelector(ctx, mod.Spec.Selector).Return([]v1.Node{n}, nil)
+		nm.EXPECT().GetAllNodesByLabelKey(ctx, targetLabel).Return([]v1.Node{n}, nil)
+		nm.EXPECT().IsNodeSchedulable(gomock.Any(), gomock.Any()).Return(false)
+		nm.EXPECT().UpdateLabels(ctx, gomock.Any(), nil, map[string]string{targetLabel: ""}).Return(nil)
+
+		Expect(drh.reconcileDRATargetLabel(ctx, mod, targetLabel, nil)).To(Succeed())
 	})
 })
