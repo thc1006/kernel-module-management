@@ -14,6 +14,7 @@ import (
 var reKernelModuleReadyLabel = regexp.MustCompile(`^kmm\.node\.kubernetes\.io/([a-zA-Z0-9-]+)\.([a-zA-Z0-9-\.]+)\.ready$`)
 var reKernelModuleVersionReadyLabel = regexp.MustCompile(`^kmm\.node\.kubernetes\.io/([a-zA-Z0-9-]+)\.([a-zA-Z0-9-\.]+)\.version\.ready$`)
 var reDeprecatedKernelModuleReadyLabel = regexp.MustCompile(`^kmm\.node\.kubernetes\.io/[a-zA-Z0-9-]+\.ready$`)
+var reDevicePluginTargetLabel = regexp.MustCompile(`^kmm\.node\.kubernetes\.io/([a-zA-Z0-9-]+)\.([a-zA-Z0-9-\.]+)\.device-plugin-target$`)
 var reDRATargetLabel = regexp.MustCompile(`^kmm\.node\.kubernetes\.io/([a-zA-Z0-9-]+)\.([a-zA-Z0-9-\.]+)\.dra-target$`)
 
 func GetModuleVersionLabelName(namespace, name string) string {
@@ -95,6 +96,17 @@ func GetDevicePluginTargetNodeLabel(namespace, moduleName string) string {
 
 func GetDRATargetNodeLabel(namespace, moduleName string) string {
 	return fmt.Sprintf("kmm.node.kubernetes.io/%s.%s.dra-target", namespace, moduleName)
+}
+
+// IsDevicePluginTargetNodeLabel returns whether label is a device-plugin-target label and, if so,
+// the namespace and name of the Module owning it.
+func IsDevicePluginTargetNodeLabel(label string) (bool, string, string) {
+	matches := reDevicePluginTargetLabel.FindStringSubmatch(label)
+	if len(matches) != 3 {
+		return false, "", ""
+	}
+
+	return true, matches[1], matches[2]
 }
 
 // IsDRATargetNodeLabel returns whether label is a dra-target label and, if so, the namespace and

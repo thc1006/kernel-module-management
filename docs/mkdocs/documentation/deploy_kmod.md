@@ -38,7 +38,16 @@ DaemonSet in the cluster.
 That DaemonSet will target nodes:
 
 - that match the `Module`'s `.spec.selector`;
-- on which the kernel module is loaded.
+- on which the kernel module is loaded;
+- that KMM still wants the plugin on (using the
+  `kmm.node.kubernetes.io/<namespace>.<modulename>.device-plugin-target` label).
+
+KMM manages the `device-plugin-target` label itself. DaemonSet pods tolerate the taint `kubectl cordon` adds, so without
+it a cordon would leave the plugin pod in place while KMM tries to unload the kernel module underneath it. KMM removes
+the label from a node that is cordoned, that carries any other taint the `Module` does not tolerate, or that has stopped
+matching `.spec.selector`, and the DaemonSet controller then removes the plugin pod. A `Module` with no
+`.spec.moduleLoader` has no kernel module to unload, so its DaemonSet targets `.spec.selector` directly and no
+`device-plugin-target` label is used.
 
 There is also support for running an init-container as part of the device-plugin by setting `.spec.devicePlugin.initContainer`.
 

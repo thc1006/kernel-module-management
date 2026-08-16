@@ -20,18 +20,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	kmmv1beta1 "github.com/kubernetes-sigs/kernel-module-management/api/v1beta1"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/constants"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/filter"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/metrics"
+	"github.com/kubernetes-sigs/kernel-module-management/internal/module"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/node"
 	"github.com/kubernetes-sigs/kernel-module-management/internal/utils"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -77,7 +81,7 @@ func (r *DevicePluginReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.DaemonSet{}).
 		Watches(
 			&v1.Node{},
-			handler.EnqueueRequestsFromMapFunc(r.filter.FindModulesForNode),
+			handler.EnqueueRequestsFromMapFunc(r.filter.FindDevicePluginModulesForNode),
 			builder.WithPredicates(filter.DevicePluginReconcilerNodePredicate()),
 		).
 		Named(DevicePluginReconcilerName).
@@ -96,35 +100,50 @@ func (r *DevicePluginReconciler) Reconcile(ctx context.Context, mod *kmmv1beta1.
 		return res, fmt.Errorf("could not get DaemonSets for module %s, namespace %s: %v", mod.Name, mod.Namespace, err)
 	}
 
+	// Labels are always dropped after the resources that select on them, so that a failing node
+	// patch can never leave a DaemonSet requiring a label that is already gone.
 	if mod.GetDeletionTimestamp() != nil {
+		if err = r.reconHelperAPI.deleteDevicePluginDaemonSets(ctx, existingDevicePluginDS); err != nil {
+			return ctrl.Result{}, err
+		}
 		if err = r.reconHelperAPI.removeDevicePluginTargetLabels(ctx, mod); err != nil {
 			return ctrl.Result{}, fmt.Errorf("could not remove device-plugin-target labels on deletion: %v", err)
 		}
-		err = r.reconHelperAPI.deleteDevicePluginDaemonSets(ctx, existingDevicePluginDS)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, nil
 	}
 
 	r.reconHelperAPI.setKMMOMetrics(ctx)
 
 	if mod.Spec.DevicePlugin == nil {
-		if err = r.reconHelperAPI.removeDevicePluginTargetLabels(ctx, mod); err != nil {
-			return ctrl.Result{}, fmt.Errorf("could not remove device-plugin-target labels: %v", err)
-		}
 		if len(existingDevicePluginDS) > 0 {
 			if err = r.reconHelperAPI.deleteDevicePluginDaemonSets(ctx, existingDevicePluginDS); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
+		if err = r.reconHelperAPI.removeDevicePluginTargetLabels(ctx, mod); err != nil {
+			return ctrl.Result{}, fmt.Errorf("could not remove device-plugin-target labels: %v", err)
+		}
 		return ctrl.Result{}, r.reconHelperAPI.clearDevicePluginStatus(ctx, mod)
 	}
 
-	if err = r.reconHelperAPI.handleDevicePluginTargetLabels(ctx, mod); err != nil {
-		return res, fmt.Errorf("could not reconcile device-plugin-target labels: %v", err)
+	// The label has to exist before the DaemonSet starts requiring it. There is only something to
+	// sequence the device plugin Pod against while a kernel module is loaded, so without a module
+	// loader the label is dropped instead, once handleDevicePlugin has stopped selecting on it.
+	if mod.Spec.ModuleLoader != nil {
+		if err = r.reconHelperAPI.handleDevicePluginTargetLabels(ctx, mod, existingDevicePluginDS); err != nil {
+			return res, fmt.Errorf("could not reconcile device-plugin-target labels: %v", err)
+		}
 	}
 
 	err = r.reconHelperAPI.handleDevicePlugin(ctx, mod, existingDevicePluginDS)
 	if err != nil {
 		return res, fmt.Errorf("could handle device plugin: %w", err)
+	}
+
+	if mod.Spec.ModuleLoader == nil {
+		if err = r.reconHelperAPI.removeDevicePluginTargetLabels(ctx, mod); err != nil {
+			return res, fmt.Errorf("could not remove stale device-plugin-target labels: %v", err)
+		}
 	}
 
 	logger.Info("Run garbage collection")
@@ -148,7 +167,7 @@ func (r *DevicePluginReconciler) Reconcile(ctx context.Context, mod *kmmv1beta1.
 type devicePluginReconcilerHelperAPI interface {
 	setKMMOMetrics(ctx context.Context)
 	handleDevicePlugin(ctx context.Context, mod *kmmv1beta1.Module, existingDevicePluginDS []appsv1.DaemonSet) error
-	handleDevicePluginTargetLabels(ctx context.Context, mod *kmmv1beta1.Module) error
+	handleDevicePluginTargetLabels(ctx context.Context, mod *kmmv1beta1.Module, existingDevicePluginDS []appsv1.DaemonSet) error
 	removeDevicePluginTargetLabels(ctx context.Context, mod *kmmv1beta1.Module) error
 	garbageCollect(ctx context.Context, mod *kmmv1beta1.Module, existingDS []appsv1.DaemonSet) error
 	deleteDevicePluginDaemonSets(ctx context.Context, existingDevicePluginDS []appsv1.DaemonSet) error
@@ -226,31 +245,108 @@ func (dprh *devicePluginReconcilerHelper) handleDevicePlugin(ctx context.Context
 	return err
 }
 
-// handleDevicePluginTargetLabels ensures the device-plugin-target label is present on schedulable
-// nodes targeted by the Module, and removed from unschedulable nodes.
-// This enables the device plugin DaemonSet to be evicted from draining nodes.
-func (dprh *devicePluginReconcilerHelper) handleDevicePluginTargetLabels(ctx context.Context, mod *kmmv1beta1.Module) error {
+// handleDevicePluginTargetLabels is the device plugin counterpart of handleDRATargetLabels. No node
+// is ever forced to keep the label: the device plugin API has no equivalent of
+// NodeUnprepareResources, so nothing holds the plugin on a node the Module no longer targets.
+func (dprh *devicePluginReconcilerHelper) handleDevicePluginTargetLabels(
+	ctx context.Context,
+	mod *kmmv1beta1.Module,
+	existingDevicePluginDS []appsv1.DaemonSet,
+) error {
 	if mod.Spec.DevicePlugin == nil {
 		return nil
 	}
 
 	targetLabel := utils.GetDevicePluginTargetNodeLabel(mod.Namespace, mod.Name)
 
-	nodes, err := dprh.nodeAPI.GetAllNodesBySelector(ctx, mod.Spec.Selector)
+	if err := dprh.reconcileDevicePluginTargetLabel(ctx, mod, targetLabel); err != nil {
+		return err
+	}
+
+	return dprh.ensureDevicePluginTargetNodeSelector(ctx, existingDevicePluginDS, targetLabel)
+}
+
+// reconcileDevicePluginTargetLabel makes targetLabel reflect the desired state on every node it can affect:
+// the nodes the Module currently selects, and the nodes that already carry the label. A node is
+// only meant to carry it while the Module both selects it and can schedule on it, so narrowing the
+// selector or removing a selector label from a node takes the label off as well.
+//
+// DaemonSet Pods tolerate the unschedulable taint, so this label is what lets the plugin Pod be
+// evicted before the kernel module it depends on is unloaded. A stale label would keep the Pod on a
+// node the Module no longer targets, and the kernel-module-ready label is not removed until the
+// unloader succeeds, which is the deadlock this label exists to break.
+func (dprh *devicePluginReconcilerHelper) reconcileDevicePluginTargetLabel(
+	ctx context.Context,
+	mod *kmmv1beta1.Module,
+	targetLabel string,
+) error {
+	selectedNodes, err := dprh.nodeAPI.GetAllNodesBySelector(ctx, mod.Spec.Selector)
 	if err != nil {
 		return fmt.Errorf("could not list nodes targeted by module: %v", err)
 	}
 
+	// By key, not by key and value: a node whose label value was corrupted still needs correcting,
+	// and the DaemonSet requires the value to be empty.
+	labeledNodes, err := dprh.nodeAPI.GetAllNodesByLabelKey(ctx, targetLabel)
+	if err != nil {
+		return fmt.Errorf("could not list nodes with %s label: %v", targetLabel, err)
+	}
+
+	selectedNames := sets.New[string]()
+	nodesByName := make(map[string]*v1.Node, len(selectedNodes)+len(labeledNodes))
+
+	for i := range selectedNodes {
+		n := &selectedNodes[i]
+		selectedNames.Insert(n.Name)
+		nodesByName[n.Name] = n
+	}
+
+	for i := range labeledNodes {
+		n := &labeledNodes[i]
+		if _, ok := nodesByName[n.Name]; !ok {
+			nodesByName[n.Name] = n
+		}
+	}
+
+	tolerations := module.EffectiveTolerations(mod.Spec.Tolerations)
+
+	// Sorted so that the errors returned for a given cluster state are always the same.
+	names := make([]string, 0, len(nodesByName))
+	for name := range nodesByName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	var errs []error
-	for i := range nodes {
-		node := &nodes[i]
-		if dprh.nodeAPI.IsNodeSchedulable(node, mod.Spec.Tolerations) {
-			if err := dprh.nodeAPI.UpdateLabels(ctx, node, map[string]string{targetLabel: ""}, nil); err != nil {
-				errs = append(errs, fmt.Errorf("could not add device-plugin-target label to node %s: %v", node.Name, err))
+	for _, name := range names {
+		n := nodesByName[name]
+
+		value, hasLabel := n.Labels[targetLabel]
+
+		// Unlike DRA, nothing here can hold the plugin on a node the Module no longer targets: the
+		// device plugin API has no equivalent of NodeUnprepareResources.
+		wantLabel := selectedNames.Has(name) && dprh.nodeAPI.IsNodeSchedulable(n, tolerations)
+
+		// The DaemonSet selects on targetLabel="", so the value is part of the desired state and a
+		// node carrying any other one still has to be patched.
+		converged := (wantLabel && hasLabel && value == "") || (!wantLabel && !hasLabel)
+		if converged {
+			continue
+		}
+
+		// A node deleted between the list and the patch needs no label, so its NotFound must not
+		// hold back the DaemonSet and DeviceClass reconciliation that follows.
+		if wantLabel {
+			if err := dprh.nodeAPI.UpdateLabels(ctx, n, map[string]string{targetLabel: ""}, nil); apierrors.IsNotFound(err) {
+				continue
+			} else if err != nil {
+				errs = append(errs, fmt.Errorf("could not add %s label to node %s: %v", targetLabel, name, err))
 			}
 		} else {
-			if err := dprh.nodeAPI.UpdateLabels(ctx, node, nil, map[string]string{targetLabel: ""}); err != nil {
-				errs = append(errs, fmt.Errorf("could not remove device-plugin-target label from node %s: %v", node.Name, err))
+			if err := dprh.nodeAPI.UpdateLabels(ctx, n, nil, map[string]string{targetLabel: ""}); apierrors.IsNotFound(err) {
+				continue
+			} else if err != nil {
+				errs = append(errs, fmt.Errorf("could not remove %s label from node %s: %v", targetLabel, name, err))
 			}
 		}
 	}
@@ -258,19 +354,73 @@ func (dprh *devicePluginReconcilerHelper) handleDevicePluginTargetLabels(ctx con
 	return errors.Join(errs...)
 }
 
+// ensureDevicePluginTargetNodeSelector adds targetLabel to the node selector of every DaemonSet passed in.
+// Only the DaemonSet for the Module's current version goes through setDevicePluginAsDesired, so without this
+// the DaemonSets an ordered upgrade left on older versions would keep selecting nodes on the
+// kernel-module-ready label alone, and cordoning one of their nodes would not evict their Pod.
+// Nothing else is touched, so each DaemonSet keeps its own image and version selector.
+func (dprh *devicePluginReconcilerHelper) ensureDevicePluginTargetNodeSelector(
+	ctx context.Context,
+	existingDevicePluginDS []appsv1.DaemonSet,
+	targetLabel string,
+) error {
+	logger := log.FromContext(ctx)
+
+	var errs []error
+	for i := range existingDevicePluginDS {
+		ds := &existingDevicePluginDS[i]
+
+		// A DaemonSet on its way out does not need migrating, and patching it would only race with
+		// its deletion.
+		if ds.GetDeletionTimestamp() != nil {
+			continue
+		}
+
+		// The value matters as much as the key: nodes carry the label with an empty value, so a
+		// DaemonSet asking for any other value would select no node at all, drop to zero desired
+		// replicas and become eligible for garbage collection while its nodes still need it.
+		if value, ok := ds.Spec.Template.Spec.NodeSelector[targetLabel]; ok && value == "" {
+			continue
+		}
+
+		patchFrom := client.MergeFrom(ds.DeepCopy())
+
+		if ds.Spec.Template.Spec.NodeSelector == nil {
+			ds.Spec.Template.Spec.NodeSelector = make(map[string]string, 1)
+		}
+		ds.Spec.Template.Spec.NodeSelector[targetLabel] = ""
+
+		if err := dprh.client.Patch(ctx, ds, patchFrom); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("could not add %s to DaemonSet %s: %v", targetLabel, ds.Name, err))
+			continue
+		}
+
+		logger.Info("Added the target node selector to an existing DaemonSet", "name", ds.Name, "label", targetLabel)
+	}
+
+	return errors.Join(errs...)
+}
+
+// removeDevicePluginTargetLabels removes the device-plugin-target label from every node carrying
+// it. It selects on the label itself, so it also reaches nodes the Module's selector no longer
+// matches.
 func (dprh *devicePluginReconcilerHelper) removeDevicePluginTargetLabels(ctx context.Context, mod *kmmv1beta1.Module) error {
 	targetLabel := utils.GetDevicePluginTargetNodeLabel(mod.Namespace, mod.Name)
 
-	nodes, err := dprh.nodeAPI.GetAllNodesBySelector(ctx, map[string]string{targetLabel: ""})
+	nodes, err := dprh.nodeAPI.GetAllNodesByLabelKey(ctx, targetLabel)
 	if err != nil {
-		return fmt.Errorf("could not list nodes with device-plugin-target label: %v", err)
+		return fmt.Errorf("could not list nodes with %s label: %v", targetLabel, err)
 	}
 
 	var errs []error
 	for i := range nodes {
-		node := &nodes[i]
-		if err := dprh.nodeAPI.UpdateLabels(ctx, node, nil, map[string]string{targetLabel: ""}); err != nil {
-			errs = append(errs, fmt.Errorf("could not remove device-plugin-target label from node %s: %v", node.Name, err))
+		n := &nodes[i]
+		if err := dprh.nodeAPI.UpdateLabels(ctx, n, nil, map[string]string{targetLabel: ""}); apierrors.IsNotFound(err) {
+			continue
+		} else if err != nil {
+			errs = append(errs, fmt.Errorf("could not remove %s label from node %s: %v", targetLabel, n.Name, err))
 		}
 	}
 
@@ -363,7 +513,7 @@ func (dprh *devicePluginReconcilerHelper) moduleUpdateDevicePluginStatus(ctx con
 	}
 
 	// get the number of nodes targeted by selector (which also relevant for device plugin)
-	numTargetedNodes, err := dprh.nodeAPI.GetNumTargetedNodes(ctx, mod.Spec.Selector, mod.Spec.Tolerations)
+	numTargetedNodes, err := dprh.nodeAPI.GetNumTargetedNodes(ctx, mod.Spec.Selector, module.EffectiveTolerations(mod.Spec.Tolerations))
 	if err != nil {
 		return fmt.Errorf("failed to determine the number of nodes that should be targeted by Module's %s/%s selector: %v", mod.Namespace, mod.Name, err)
 	}

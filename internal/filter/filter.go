@@ -2,6 +2,8 @@ package filter
 
 import (
 	"context"
+	"reflect"
+
 	"github.com/go-logr/logr"
 	v1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
@@ -9,7 +11,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubectl/pkg/util/podutils"
 	clusterv1 "open-cluster-management.io/api/cluster/v1"
-	"reflect"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -200,10 +201,14 @@ func ModuleReconcilerNodePredicate() predicate.Predicate {
 	)
 }
 
+// DevicePluginReconcilerNodePredicate matches the node events the device plugin reconciler acts on:
+// creations, taint changes, and label changes. Label changes matter because a node that stops
+// matching a Module's selector must have its device-plugin-target label removed, and because that
+// label is what the reconciler converges on.
 func DevicePluginReconcilerNodePredicate() predicate.Predicate {
 	return predicate.And(
 		skipDeletions,
-		nodeTaintsChanged,
+		predicate.Or(nodeTaintsChanged, predicate.LabelChangedPredicate{}),
 	)
 }
 
@@ -340,6 +345,57 @@ func (f *Filter) FindDRAModulesForNode(ctx context.Context, node client.Object) 
 		mod := &mods.Items[i]
 
 		if mod.Spec.DRA == nil {
+			continue
+		}
+
+		selected, err := utils.IsObjectSelectedByLabels(node.GetLabels(), mod.Spec.Selector)
+		if err != nil {
+			logger.Error(err, "could not determine if node is selected by module", "module", mod.Name)
+			continue
+		}
+
+		if !selected {
+			continue
+		}
+
+		reqSet.Insert(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: mod.Namespace, Name: mod.Name}})
+	}
+
+	reqs := reqSet.UnsortedList()
+
+	logger.Info("Adding reconciliation requests", "count", len(reqs))
+	logger.V(1).Info("New requests", "requests", reqs)
+
+	return reqs
+}
+
+// FindDevicePluginModulesForNode enqueues the Modules a node event can affect for the device plugin reconciler: those
+// whose selector matches the node, and those that still own a device-plugin-target label on it. The second
+// set is what lets a node that stopped matching the selector get its stale label cleaned up.
+func (f *Filter) FindDevicePluginModulesForNode(ctx context.Context, node client.Object) []reconcile.Request {
+	logger := ctrl.LoggerFrom(ctx).WithValues("node", node.GetName())
+
+	reqSet := sets.New[reconcile.Request]()
+
+	// A device-plugin-target label names the Module that owns it, so these do not need a Module list and are
+	// found even when the Module no longer selects this node.
+	for label := range node.GetLabels() {
+		if ok, ns, name := utils.IsDevicePluginTargetNodeLabel(label); ok {
+			reqSet.Insert(reconcile.Request{NamespacedName: types.NamespacedName{Namespace: ns, Name: name}})
+		}
+	}
+
+	mods := kmmv1beta1.ModuleList{}
+
+	if err := f.client.List(ctx, &mods); err != nil {
+		logger.Error(err, "could not list modules")
+		return reqSet.UnsortedList()
+	}
+
+	for i := range mods.Items {
+		mod := &mods.Items[i]
+
+		if mod.Spec.DevicePlugin == nil {
 			continue
 		}
 
