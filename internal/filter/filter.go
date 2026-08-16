@@ -279,7 +279,7 @@ func (f *Filter) FindModulesForNode(ctx context.Context, node client.Object) []r
 
 	mods := kmmv1beta1.ModuleList{}
 
-	if err := f.client.List(context.Background(), &mods); err != nil {
+	if err := f.client.List(ctx, &mods); err != nil {
 		logger.Error(err, "could not list modules")
 		return reqs
 	}
@@ -294,7 +294,7 @@ func (f *Filter) FindModulesForNode(ctx context.Context, node client.Object) []r
 		moduleSelectorMatchNode, err := utils.IsObjectSelectedByLabels(node.GetLabels(), mod.Spec.Selector)
 		if err != nil {
 			logger.Error(err, "could not determine if node is selected by module", "node", node.GetName(), "module", mod.Name)
-			return reqs
+			continue
 		}
 
 		if !moduleSelectorMatchNode {

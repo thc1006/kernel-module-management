@@ -1160,3 +1160,43 @@ var _ = Describe("nodeTaintsChanged", func() {
 		Entry("taints are equal between old and new", &taint2, &taint2, false),
 	)
 })
+
+var _ = Describe("FindModulesForNode error handling", func() {
+	BeforeEach(func() {
+		mockCtrl = gomock.NewController(GinkgoT())
+		clnt = mockClient.NewMockClient(mockCtrl)
+		f = New(clnt, nil)
+	})
+
+	ctx := context.Background()
+
+	It("should return nothing when listing modules fails", func() {
+		clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).Return(errors.New("some error"))
+
+		Expect(f.FindModulesForNode(ctx, &v1.Node{})).To(BeEmpty())
+	})
+
+	It("should keep processing modules after one with an invalid selector", func() {
+		clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+			func(_ interface{}, list *kmmv1beta1.ModuleList, _ ...interface{}) error {
+				list.Items = []kmmv1beta1.Module{
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "ns"},
+						Spec:       kmmv1beta1.ModuleSpec{Selector: map[string]string{"$invalid key": "value"}},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "good", Namespace: "ns"},
+						Spec:       kmmv1beta1.ModuleSpec{Selector: map[string]string{"worker": "true"}},
+					},
+				}
+				return nil
+			},
+		)
+
+		node := v1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"worker": "true"}}}
+
+		Expect(f.FindModulesForNode(ctx, &node)).To(ConsistOf(
+			reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "good"}},
+		))
+	})
+})
