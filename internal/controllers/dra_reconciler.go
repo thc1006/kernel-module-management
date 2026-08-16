@@ -587,7 +587,7 @@ func (drh *draReconcilerHelper) moduleUpdateDRAStatus(ctx context.Context,
 		return nil
 	}
 
-	numTargetedNodes, err := drh.nodeAPI.GetNumTargetedNodes(ctx, mod.Spec.Selector, mod.Spec.Tolerations)
+	numTargetedNodes, err := drh.nodeAPI.GetNumTargetedNodes(ctx, mod.Spec.Selector, module.EffectiveTolerations(mod.Spec.Tolerations))
 	if err != nil {
 		return fmt.Errorf("failed to determine the number of nodes targeted by Module %s/%s selector: %v", mod.Namespace, mod.Name, err)
 	}
