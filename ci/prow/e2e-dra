@@ -60,8 +60,8 @@ echo "Check that the consumer pod is running on the node with the DRA driver"
 kubectl wait --for=condition=Ready pod/dra-consumer --timeout=2m
 [ "$(kubectl get pod dra-consumer -o jsonpath='{.spec.nodeName}')" = "minikube" ]
 
-# The waits added here assign the kubectl output before testing it, so that a kubectl failure keeps
-# the loop running until it times out instead of being read as "the resource is already gone".
+# Every wait below assigns the kubectl output before testing it, so that a kubectl failure keeps the
+# loop running until it times out instead of being read as "the resource is already gone".
 DRA_SELECTOR='kmm.node.kubernetes.io/role=dra,kmm.node.kubernetes.io/module.name=kmm-ci-dra'
 DRA_TARGET_LABEL='kmm.node.kubernetes.io/default.kmm-ci-dra.dra-target'
 
@@ -132,16 +132,16 @@ echo "Remove the Module"
 kubectl delete -f ci/module-kmm-ci-dra.yaml --wait=false
 
 echo "Check that the DRA DaemonSet gets cleaned up"
-timeout 2m bash -c 'until [ "$(kubectl get ds -l kmm.node.kubernetes.io/role=dra,kmm.node.kubernetes.io/module.name=kmm-ci-dra --no-headers 2>/dev/null | wc -l)" -eq 0 ]; do sleep 3; done'
+timeout 2m bash -c 'until out=$(kubectl get ds -l '"${DRA_SELECTOR}"' -o name) && [ -z "${out}" ]; do sleep 3; done'
 
 echo "Check that the DeviceClass gets cleaned up"
-timeout 1m bash -c 'until ! kubectl get deviceclass kmm-ci-test-device 2>/dev/null; do sleep 3; done'
+kubectl wait --for=delete deviceclass/kmm-ci-test-device --timeout=1m
 
 echo "Check that the DRA target label gets cleaned up"
 timeout 1m bash -c 'until out=$(kubectl get nodes -l '"${DRA_TARGET_LABEL}"' -o name) && [ -z "${out}" ]; do sleep 3; done'
 
 echo "Check that the module gets unloaded from the node"
-timeout 1m bash -c 'until ! minikube ssh -- lsmod | grep kmm_ci_a; do sleep 3; done'
+timeout 1m bash -c 'until out=$(minikube ssh -- lsmod) && ! echo "${out}" | grep -q kmm_ci_a; do sleep 3; done'
 
 echo "Wait for the Module to be deleted"
 kubectl wait --for delete modules.kmm.sigs.x-k8s.io/kmm-ci-dra
