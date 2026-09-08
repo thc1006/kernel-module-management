@@ -195,3 +195,107 @@ var _ = Describe("pluginPodsRemain", func() {
 		Expect(err).To(HaveOccurred())
 	})
 })
+
+var _ = Describe("removeNodeLabel", func() {
+	const key = "kmm.node.kubernetes.io/ns.mod.device-plugin-target"
+
+	var (
+		ctrl *gomock.Controller
+		clnt *client.MockClient
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		clnt = client.NewMockClient(ctrl)
+	})
+
+	ctx := context.Background()
+
+	It("looks for the key rather than a value, and takes only that key off", func() {
+		node := v1.Node{ObjectMeta: metav1.ObjectMeta{
+			Name:   "node",
+			Labels: map[string]string{key: "edited", "other": "keep"},
+		}}
+
+		gomock.InOrder(
+			clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, l ctrlclient.ObjectList, opts ...ctrlclient.ListOption) error {
+					Expect(opts).To(HaveLen(1))
+					Expect(opts[0]).To(Equal(ctrlclient.HasLabels{key}))
+					l.(*v1.NodeList).Items = []v1.Node{node}
+					return nil
+				},
+			),
+			clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, o ctrlclient.Object, p ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+					data, err := p.Data(o)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(string(data)).To(ContainSubstring(`"` + key + `":null`))
+					Expect(string(data)).NotTo(ContainSubstring("other"))
+					return nil
+				},
+			),
+		)
+
+		Expect(removeNodeLabel(ctx, clnt, clnt, key)).To(Succeed())
+	})
+
+	It("names the key even when it is the last label on the node", func() {
+		node := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node", Labels: map[string]string{key: ""}}}
+
+		gomock.InOrder(
+			clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, l ctrlclient.ObjectList, _ ...ctrlclient.ListOption) error {
+					l.(*v1.NodeList).Items = []v1.Node{node}
+					return nil
+				},
+			),
+			clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, o ctrlclient.Object, p ctrlclient.Patch, _ ...ctrlclient.PatchOption) error {
+					data, err := p.Data(o)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(string(data)).To(ContainSubstring(`"` + key + `":null`))
+					return nil
+				},
+			),
+		)
+
+		Expect(removeNodeLabel(ctx, clnt, clnt, key)).To(Succeed())
+	})
+
+	It("reports a read failure rather than an empty cluster", func() {
+		clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).Return(fmt.Errorf("some error"))
+
+		Expect(removeNodeLabel(ctx, clnt, clnt, key)).NotTo(Succeed())
+	})
+
+	It("does not fail over a node that has gone", func() {
+		gomock.InOrder(
+			clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, l ctrlclient.ObjectList, _ ...ctrlclient.ListOption) error {
+					l.(*v1.NodeList).Items = []v1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node"}}}
+					return nil
+				},
+			),
+			clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).
+				Return(apierrors.NewNotFound(schema.GroupResource{}, "node")),
+		)
+
+		Expect(removeNodeLabel(ctx, clnt, clnt, key)).To(Succeed())
+	})
+
+	It("reports a patch that was refused, so the module is not released", func() {
+		gomock.InOrder(
+			clnt.EXPECT().List(ctx, gomock.Any(), gomock.Any()).DoAndReturn(
+				func(_ context.Context, l ctrlclient.ObjectList, _ ...ctrlclient.ListOption) error {
+					l.(*v1.NodeList).Items = []v1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node"}}}
+					return nil
+				},
+			),
+			clnt.EXPECT().Patch(ctx, gomock.Any(), gomock.Any()).
+				Return(apierrors.NewForbidden(schema.GroupResource{}, "node", fmt.Errorf("nope"))),
+		)
+
+		Expect(removeNodeLabel(ctx, clnt, clnt, key)).NotTo(Succeed())
+	})
+})

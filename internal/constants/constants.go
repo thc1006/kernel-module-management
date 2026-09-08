@@ -19,9 +19,10 @@ const (
 	ModuleFinalizer   = "kmm.node.kubernetes.io/module-finalizer"
 	JobEventFinalizer = "kmm.node.kubernetes.io/job-event-finalizer"
 
-	// The DRA reconciler holds the Module itself, because ModuleFinalizer is released as soon as no
-	// NMC lists the Module as in use, which says nothing about whether the cleanup has finished.
-	DRAFinalizer = "kmm.node.kubernetes.io/dra-cleanup"
+	// Each plugin holds the Module itself, because ModuleFinalizer is released as soon as no NMC
+	// lists the Module as in use, which says nothing about whether the plugin has finished.
+	DRAFinalizer          = "kmm.node.kubernetes.io/dra-cleanup"
+	DevicePluginFinalizer = "kmm.node.kubernetes.io/device-plugin-cleanup"
 
 	ManagedClusterModuleNameLabel  = "kmm.node.kubernetes.io/managedclustermodule.name"
 	KernelVersionsClusterClaimName = "kernel-versions.kmm.node.kubernetes.io"

@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -26,6 +27,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -94,4 +96,31 @@ func pluginPodsRemain(
 	}
 
 	return false, nil
+}
+
+// removeNodeLabel takes one label key off every node that carries it, whatever its value. A node
+// whose label was edited would otherwise keep it for good.
+func removeNodeLabel(ctx context.Context, c client.Client, reader client.Reader, key string) error {
+	nodes := v1.NodeList{}
+	if err := reader.List(ctx, &nodes, client.HasLabels{key}); err != nil {
+		return fmt.Errorf("could not list nodes with %s: %v", key, err)
+	}
+
+	// Spelled out, not diffed: labels is omitempty, so a node left with none diffs to labels null.
+	quoted, _ := json.Marshal(key) // cannot fail for a string
+	payload := []byte(`{"metadata":{"labels":{` + string(quoted) + `:null}}}`)
+
+	var errs []error
+
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+
+		// No optimistic lock: the patch names one key, so it cannot disturb another writer.
+		err := c.Patch(ctx, node, client.RawPatch(types.MergePatchType, payload))
+		if err != nil && !apierrors.IsNotFound(err) {
+			errs = append(errs, fmt.Errorf("could not remove %s from node %s: %v", key, node.Name, err))
+		}
+	}
+
+	return errors.Join(errs...)
 }

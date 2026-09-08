@@ -146,6 +146,7 @@ func main() {
 
 	dpc := controllers.NewDevicePluginReconciler(
 		client,
+		mgr.GetAPIReader(),
 		metricsAPI,
 		filterAPI,
 		nodeAPI,
