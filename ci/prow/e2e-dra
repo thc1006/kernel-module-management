@@ -78,3 +78,41 @@ timeout 1m bash -c 'until ! minikube ssh -- lsmod | grep kmm_ci_a; do sleep 3; d
 
 echo "Wait for the Module to be deleted"
 kubectl wait --for delete modules.kmm.sigs.x-k8s.io/kmm-ci-dra
+
+# No moduleLoader means no NMC, so ModuleFinalizer goes at once and only the DRA one is left.
+source ci/prow/finalizer-test-lib.sh
+
+echo "Deploy a Module with a DRA spec and no moduleLoader"
+kubectl apply -f ci/module-kmm-ci-dra-only.yaml
+
+echo "Wait for the DRA finalizer and the DeviceClass"
+timeout 2m bash -c 'until kubectl get module kmm-ci-dra-only -o json | jq -e ".metadata.finalizers | index(\"kmm.node.kubernetes.io/dra-cleanup\")"; do sleep 3; done'
+timeout 2m bash -c 'until kubectl get deviceclass kmm-ci-cleanup-device; do sleep 3; done'
+
+echo "Hold the DeviceClass so that its deletion cannot complete"
+hold_with_test_finalizer deviceclass/kmm-ci-cleanup-device
+# Pinned, so one that goes and comes back under the same name fails rather than reads as the one held.
+DC_UID=$(kubectl get deviceclass kmm-ci-cleanup-device -o jsonpath='{.metadata.uid}')
+trap 'release_test_finalizer deviceclass/kmm-ci-cleanup-device || true' EXIT
+
+kubectl delete module kmm-ci-dra-only --wait=false
+
+# Either would hold the Module by itself, and the check below would then pass without the DeviceClass.
+echo "Wait until the held DeviceClass is the only thing the Module waits for"
+timeout 2m bash -c 'until out=$(kubectl get ds,pod -l kmm.node.kubernetes.io/module.name=kmm-ci-dra-only -o name) && [ -z "${out}" ]; do sleep 3; done'
+timeout 2m bash -c 'until kubectl get module kmm-ci-dra-only -o json | jq -e ".metadata.deletionTimestamp != null and .metadata.finalizers == [\"kmm.node.kubernetes.io/dra-cleanup\"]"; do sleep 3; done'
+
+echo "Check that the Module is not released while the DeviceClass is still there"
+for _ in $(seq 10); do
+  kubectl get module kmm-ci-dra-only -o json | jq -e '.metadata.finalizers == ["kmm.node.kubernetes.io/dra-cleanup"]'
+  [ "$(kubectl get deviceclass kmm-ci-cleanup-device -o jsonpath='{.metadata.uid}')" = "${DC_UID}" ]
+  sleep 2
+done
+
+echo "Release the DeviceClass"
+release_test_finalizer deviceclass/kmm-ci-cleanup-device
+trap - EXIT
+
+echo "Check that the DeviceClass and the Module then go"
+kubectl wait --for delete deviceclass/kmm-ci-cleanup-device --timeout=2m
+kubectl wait --for delete modules.kmm.sigs.x-k8s.io/kmm-ci-dra-only --timeout=2m

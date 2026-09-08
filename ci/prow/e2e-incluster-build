@@ -60,3 +60,54 @@ check_module_not_loaded "kmm_ci_b"
 
 echo "Wait for the Module to be deleted..."
 kubectl wait --for delete modules.kmm.sigs.x-k8s.io/kmm-ci
+
+# No moduleLoader means no NMC, so only device-plugin-cleanup is left, and what it waits for is a
+# Pod: the DaemonSet goes with foreground propagation, so holding a Pod holds the DaemonSet too.
+source ci/prow/finalizer-test-lib.sh
+
+echo "Deploy a Module with a device plugin and no moduleLoader..."
+kubectl apply -f ci/module-kmm-ci-device-plugin-only.yaml
+
+echo "Wait for the device plugin finalizer and its Pod..."
+timeout 2m bash -c 'until kubectl get module kmm-ci-device-plugin-only -o json | jq -e ".metadata.finalizers | index(\"kmm.node.kubernetes.io/device-plugin-cleanup\")"; do sleep 3; done'
+timeout 5m bash -c 'until kubectl get pod -l kmm.node.kubernetes.io/module.name=kmm-ci-device-plugin-only -o json | jq -e ".items | length > 0"; do sleep 3; done'
+
+DP_POD=pod/$(kubectl get pod -l kmm.node.kubernetes.io/module.name=kmm-ci-device-plugin-only -o jsonpath='{.items[0].metadata.name}')
+DP_UID=$(kubectl get "${DP_POD}" -o jsonpath='{.metadata.uid}')
+DP_READY_LABEL=kmm.node.kubernetes.io/default.kmm-ci-device-plugin-only.device-plugin-ready
+DP_TARGET_LABEL=kmm.node.kubernetes.io/default.kmm-ci-device-plugin-only.device-plugin-target
+
+# Both labels have to be there first, so that neither going missing later can read as cleanup.
+echo "Wait for the Pod to be ready and for both of its node labels..."
+kubectl wait --for=condition=Ready "${DP_POD}" --timeout=5m
+timeout 2m bash -c "until kubectl get node minikube -o json | jq -e '.metadata.labels | has(\"${DP_READY_LABEL}\") and has(\"${DP_TARGET_LABEL}\")'; do sleep 3; done"
+
+# Beside KMM's own finalizer on the Pod, never over it: what the test watches is KMM releasing its.
+echo "Hold ${DP_POD} so that its deletion cannot complete..."
+kubectl get "${DP_POD}" -o json | jq -e '.metadata.finalizers | index("kmm.node.kubernetes.io/node-labeler")'
+hold_with_test_finalizer "${DP_POD}"
+trap 'release_test_finalizer "${DP_POD}" || true' EXIT
+
+kubectl delete module kmm-ci-device-plugin-only --wait=false
+
+echo "Wait until the held Pod is the only thing the Module waits for..."
+timeout 2m bash -c "until kubectl get daemonset -l kmm.node.kubernetes.io/module.name=kmm-ci-device-plugin-only -o json | jq -e '[.items[] | select(.metadata.deletionTimestamp == null)] | length == 0'; do sleep 3; done"
+timeout 2m bash -c "until kubectl get node minikube -o json | jq -e '.metadata.labels | has(\"${DP_READY_LABEL}\") | not'; do sleep 3; done"
+timeout 2m bash -c "until kubectl get ${DP_POD} -o json | jq -e '(.metadata.finalizers | index(\"kmm.node.kubernetes.io/node-labeler\")) == null'; do sleep 3; done"
+timeout 2m bash -c "until kubectl get module kmm-ci-device-plugin-only -o json | jq -e '.metadata.deletionTimestamp != null and .metadata.finalizers == [\"kmm.node.kubernetes.io/device-plugin-cleanup\"]'; do sleep 3; done"
+
+echo "Check that the Module is not released while its Pod is still there..."
+for _ in $(seq 10); do
+  kubectl get module kmm-ci-device-plugin-only -o json | jq -e '.metadata.finalizers == ["kmm.node.kubernetes.io/device-plugin-cleanup"]'
+  [ "$(kubectl get "${DP_POD}" -o jsonpath='{.metadata.uid}')" = "${DP_UID}" ]
+  sleep 2
+done
+
+echo "Release the Pod..."
+release_test_finalizer "${DP_POD}"
+trap - EXIT
+
+echo "Check that the Pod, the Module and the node target label then go..."
+kubectl wait --for delete "${DP_POD}" --timeout=2m
+kubectl wait --for delete modules.kmm.sigs.x-k8s.io/kmm-ci-device-plugin-only --timeout=2m
+kubectl get node minikube -o json | jq -e ".metadata.labels | has(\"${DP_TARGET_LABEL}\") | not"
